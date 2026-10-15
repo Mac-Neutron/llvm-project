@@ -1419,6 +1419,22 @@ void BitcodeFile::parse() {
       sym = symtab.addUndefined(symName, this, false);
       if (objSym.isWeak())
         sym->deferUndefined = true;
+      // An ARM64EC bitcode file names the functions it calls demangled; the
+      // object file LTO makes from it calls their mangled (#) forms, which is
+      // all ARM64EC archives index. Bind the two with an anti-dependency
+      // alias, as ARM64EC object files do, so that archive members defining
+      // the mangled form are loaded before LTO runs.
+      else if (symtab.isEC() && objSym.isExecutable()) {
+        auto *u = dyn_cast<Undefined>(sym);
+        if (u && !u->weakAlias) {
+          if (std::optional<std::string> mangledName =
+                  getArm64ECMangledFunctionName(symName)) {
+            Symbol *m = symtab.addUndefined(saver.save(*mangledName), this,
+                                            /*overrideLazy=*/false);
+            u->setWeakAlias(m, /*antiDep=*/true);
+          }
+        }
+      }
       // If one LTO object file references (i.e. has an undefined reference to)
       // a symbol with an __imp_ prefix, the LTO compilation itself sees it
       // as unprefixed but with a dllimport attribute instead, and doesn't

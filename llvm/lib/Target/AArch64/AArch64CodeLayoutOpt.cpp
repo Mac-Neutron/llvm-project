@@ -169,6 +169,14 @@ bool AArch64CodeLayoutOpt::runOnMachineFunction(MachineFunction &MF) {
   const auto *Subtarget = &MF.getSubtarget<AArch64Subtarget>();
   TII = Subtarget->getInstrInfo();
 
+  // Windows' ARM64 unwind information (SEH) records each function's length,
+  // which MC must know when it emits it; padding inside a function leaves the
+  // length unknown at that point ("Failed to evaluate function length in SEH
+  // unwind info", MCWin64EH). AArch64ISelLowering doesn't align loops on
+  // Windows for the same reason.
+  if (Subtarget->isTargetWindows())
+    return false;
+
   // Default: enable when the subtarget opts in via FeatureAlignCmpCSelPairs.
   if (!EnableCodeAlignment.getBits() && Subtarget->hasAlignCmpCSelPairs()) {
     if (Subtarget->hasFuseCmpCSel())

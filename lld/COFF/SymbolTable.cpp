@@ -442,6 +442,19 @@ void SymbolTable::reportUnresolvable() {
         continue;
       }
     }
+    // An ARM64EC function defined in bitcode is named demangled there; only
+    // the object file LTO makes from it defines the mangled (#) form object
+    // files (hand-written assembly) may call. Keep the function for them.
+    if (isEC()) {
+      if (std::optional<std::string> demangledName =
+              getArm64ECDemangledFunctionName(name)) {
+        Defined *def = dyn_cast_or_null<Defined>(find(*demangledName));
+        if (def && isa<BitcodeFile>(def->getFile())) {
+          def->isUsedInRegularObj = true;
+          continue;
+        }
+      }
+    }
     if (name.contains("_PchSym_"))
       continue;
     if (ctx.config.autoImport && impSymbol(name))

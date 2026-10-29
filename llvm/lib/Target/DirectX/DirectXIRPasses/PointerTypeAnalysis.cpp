@@ -54,9 +54,18 @@ Type *classifyPointerType(const Value *V, PointerTypeMap &Map) {
     PointeeTy = GV->getValueType();
   }
 
+  // Provisional, so a cycle of pointer phis ends (a phi is classified from its users, below).
+  Map[V] = TypedPointerType::get(Type::getInt8Ty(V->getContext()),
+                                 V->getType()->getPointerAddressSpace());
   for (const auto *User : V->users()) {
     Type *NewPointeeTy = nullptr;
-    if (const auto *Inst = dyn_cast<LoadInst>(User)) {
+    if (isa<SelectInst>(User) || isa<PHINode>(User)) {
+      // A select or phi of pointers is typed by its operands in bitcode: an operand takes the result's type (AIR's
+      // bounds-checked buffer accesses select between a pointer and null).
+      if (User->getType()->isPointerTy())
+        if (auto *Typed = dyn_cast<TypedPointerType>(classifyPointerType(User, Map)))
+          NewPointeeTy = Typed->getElementType();
+    } else if (const auto *Inst = dyn_cast<LoadInst>(User)) {
       NewPointeeTy = Inst->getType();
     } else if (const auto *Inst = dyn_cast<StoreInst>(User)) {
       NewPointeeTy = Inst->getValueOperand()->getType();

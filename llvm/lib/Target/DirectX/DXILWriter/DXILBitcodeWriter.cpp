@@ -1183,6 +1183,10 @@ void DXILBitcodeWriter::writeModuleInfo() {
   StringRef Triple = "dxil-ms-dx";
   StringRef DL = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-"
                  "f16:16-f32:32-f64:64-n8:16:32:64";
+  // An AIR (Metal) module, which this writer gives typed pointers, keeps its own triple and data layout.
+  std::string ModuleTriple = M.getTargetTriple().str(), ModuleDL = M.getDataLayoutStr();
+  if (StringRef(ModuleTriple).starts_with("air"))
+    Triple = ModuleTriple, DL = ModuleDL;
   writeStringRecord(Stream, bitc::MODULE_CODE_TRIPLE, Triple, 0 /*TODO*/);
   writeStringRecord(Stream, bitc::MODULE_CODE_DATALAYOUT, DL, 0 /*TODO*/);
 
@@ -2499,7 +2503,7 @@ void DXILBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
       if (!pushValueAndType(I.getOperand(0), InstID, Vals)) // ptr
         AbbrevToUse = (unsigned)FUNCTION_INST_LOAD_ABBREV;
     }
-    Vals.push_back(getTypeID(I.getType()));
+    Vals.push_back(getTypeID(I.getType(), &I)); // a pointer load: the loaded value's typed pointer
     Vals.push_back(Log2(cast<LoadInst>(I).getAlign()) + 1);
     Vals.push_back(cast<LoadInst>(I).isVolatile());
     if (cast<LoadInst>(I).isAtomic()) {

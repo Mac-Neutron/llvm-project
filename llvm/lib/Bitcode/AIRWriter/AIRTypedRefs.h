@@ -28,13 +28,20 @@ class LLVMContext;
 
 namespace air {
 
-/// Typed types by name, all in one context.
+/// Typed types by name, all in one context. Identified structs in them are
+/// the context's own, by name.
 struct AIRRefTable {
   StringMap<FunctionType *> Functions;
+  /// Value types.
   StringMap<Type *> Globals;
+  /// Typed literal bodies, for the identified structs the context has.
   StringMap<StructType *> Bodies;
 };
 
+/// Scans each ref (raw or Darwin-wrapped bitcode, typed pointers). A function,
+/// global or body whose type holds a struct the context lacks, or a type this
+/// reader does not build, is left out. Malformed input, an opaque pointer, and
+/// two refs that give one name two types are errors: "typed ref <n>: <why>".
 Expected<AIRRefTable> readTypedRefs(LLVMContext &C,
                                     ArrayRef<MemoryBufferRef> Refs);
 

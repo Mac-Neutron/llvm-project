@@ -8,8 +8,9 @@
 // lib/Target/DirectX/DXILWriter/DXILValueEnumerator.cpp at llvmorg-23.1.4 for
 // the AIR writer; namespace llvm::air; no DXIL debug info map and no use-list
 // order prediction (the writer writes no use lists); every type is enumerated
-// in its typed form, from AIRModuleTypes, in module and instruction order; a
-// lookup that misses is an error, not a dereference of end() (P17).
+// in its typed form, from AIRPointerTypes, in module and instruction order,
+// and every operand as its typed operand, synthetic typed constants included
+// (P6); a lookup that misses is an error, not a dereference of end() (P17).
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AIRValueEnumerator.h"
+#include "AIRPointerTypes.h"
 #include "AIRTypes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -58,7 +60,7 @@
 using namespace llvm;
 using namespace llvm::air;
 
-ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
+ValueEnumerator::ValueEnumerator(const Module &M, const AIRPointerTypes &Typed)
     : Typed(Typed) {
   // Enumerate the global variables.
   for (const GlobalVariable &GV : M.globals()) {
@@ -70,7 +72,7 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
   for (const Function &F : M) {
     EnumerateValue(&F);
     EnumerateType(Typed.functionType(F));
-    EnumerateType(Typed.typeOf(&F));
+    EnumerateType(Typed.typedTypeOf(&F));
     EnumerateAttributes(F.getAttributes());
   }
 
@@ -89,15 +91,15 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
   // Enumerate the global variable initializers and attributes.
   for (const GlobalVariable &GV : M.globals()) {
     if (GV.hasInitializer())
-      EnumerateValue(GV.getInitializer());
-    EnumerateType(Typed.typeOf(&GV));
+      EnumerateValue(Typed.typedOperand(GV.getOperandUse(0)));
+    EnumerateType(Typed.typedTypeOf(&GV));
     if (GV.hasAttributes())
       EnumerateAttributes(GV.getAttributesAsList(AttributeList::FunctionIndex));
   }
 
   // Enumerate the aliasees.
   for (const GlobalAlias &GA : M.aliases())
-    EnumerateValue(GA.getAliasee());
+    EnumerateValue(Typed.typedOperand(GA.getOperandUse(0)));
 
   // Enumerate the ifunc resolvers.
   for (const GlobalIFunc &GIF : M.ifuncs())
@@ -106,7 +108,7 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
   // Enumerate any optional Function data.
   for (const Function &F : M)
     for (const Use &U : F.operands())
-      EnumerateValue(U.get());
+      EnumerateValue(Typed.typedOperand(U));
 
   // Enumerate the metadata type.
   //
@@ -133,7 +135,7 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
   // Enumerate types used by function bodies and argument lists.
   for (const Function &F : M) {
     for (const Argument &A : F.args())
-      EnumerateType(Typed.typeOf(&A));
+      EnumerateType(Typed.typedTypeOf(&A));
 
     // Enumerate metadata attached to this function.
     MDs.clear();
@@ -146,7 +148,7 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
         for (const Use &Op : I.operands()) {
           auto *MD = dyn_cast<MetadataAsValue>(&Op);
           if (!MD) {
-            EnumerateOperandType(Op);
+            EnumerateOperandType(Typed.typedOperand(Op));
             continue;
           }
 
@@ -170,7 +172,7 @@ ValueEnumerator::ValueEnumerator(const Module &M, const AIRModuleTypes &Typed)
           EnumerateType(Typed.sourceType(*GEP));
         if (auto *AI = dyn_cast<AllocaInst>(&I))
           EnumerateType(Typed.allocatedType(*AI));
-        EnumerateType(Typed.typeOf(&I));
+        EnumerateType(Typed.typedTypeOf(&I));
         if (const auto *Call = dyn_cast<CallBase>(&I)) {
           EnumerateAttributes(Call->getAttributes());
           EnumerateType(Typed.callType(*Call));
@@ -638,7 +640,16 @@ void ValueEnumerator::EnumerateValue(const Value *V) {
       Comdats.insert(C);
 
   // Enumerate the typed type of this value.
-  EnumerateType(Typed.typeOf(V));
+  EnumerateType(Typed.typedTypeOf(V));
+
+  // A synthetic typed constant: its typed operands first, as for a constant.
+  if (const AIRPointerTypes::Synthetic *S = Typed.synthetic(V)) {
+    for (const Value *Op : S->Ops)
+      EnumerateValue(Op);
+    Values.push_back(std::make_pair(V, 1U));
+    ValueMap[V] = Values.size();
+    return;
+  }
 
   if (const Constant *C = dyn_cast<Constant>(V)) {
     if (isa<GlobalValue>(C)) {
@@ -652,10 +663,9 @@ void ValueEnumerator::EnumerateValue(const Value *V) {
       // itself.  This makes it more likely that we can avoid forward references
       // in the reader.  We know that there can be no cycles in the constants
       // graph that don't go through a global variable.
-      for (User::const_op_iterator I = C->op_begin(), E = C->op_end(); I != E;
-           ++I)
-        if (!isa<BasicBlock>(*I)) // Don't enumerate BB operand to BlockAddress.
-          EnumerateValue(*I);
+      for (const Use &Op : C->operands())
+        if (!isa<BasicBlock>(Op)) // Don't enumerate BB operand to BlockAddress.
+          EnumerateValue(Typed.typedOperand(Op));
       if (auto *CE = dyn_cast<ConstantExpr>(C)) {
         if (CE->getOpcode() == Instruction::ShuffleVector)
           EnumerateValue(CE->getShuffleMaskForBitcode());
@@ -715,28 +725,34 @@ void ValueEnumerator::EnumerateType(Type *Ty) {
 // Enumerate the types for the specified value.  If the value is a constant,
 // walk through it, enumerating the types of the constant.
 void ValueEnumerator::EnumerateOperandType(const Value *V) {
-  EnumerateType(Typed.typeOf(V));
+  EnumerateType(Typed.typedTypeOf(V));
 
   assert(!isa<MetadataAsValue>(V) && "Unexpected metadata operand");
+
+  // If this constant is already enumerated, ignore it, we know its type must
+  // be enumerated.
+  if (ValueMap.count(V))
+    return;
+
+  if (const AIRPointerTypes::Synthetic *S = Typed.synthetic(V)) {
+    for (const Value *Op : S->Ops)
+      EnumerateOperandType(Op);
+    return;
+  }
 
   const Constant *C = dyn_cast<Constant>(V);
   if (!C)
     return;
 
-  // If this constant is already enumerated, ignore it, we know its type must
-  // be enumerated.
-  if (ValueMap.count(C))
-    return;
-
   // This constant may have operands, make sure to enumerate the types in
   // them.
-  for (const Value *Op : C->operands()) {
+  for (const Use &Op : C->operands()) {
     // Don't enumerate basic blocks here, this happens as operands to
     // blockaddress.
     if (isa<BasicBlock>(Op))
       continue;
 
-    EnumerateOperandType(Op);
+    EnumerateOperandType(Typed.typedOperand(Op));
   }
   if (auto *CE = dyn_cast<ConstantExpr>(C)) {
     if (CE->getOpcode() == Instruction::ShuffleVector)
@@ -801,8 +817,10 @@ void ValueEnumerator::incorporateFunction(const Function &F) {
   for (const BasicBlock &BB : F) {
     for (const Instruction &I : BB) {
       for (const Use &OI : I.operands()) {
-        if ((isa<Constant>(OI) && !isa<GlobalValue>(OI)) || isa<InlineAsm>(OI))
-          EnumerateValue(OI);
+        const Value *V = Typed.typedOperand(OI);
+        if (Typed.synthetic(V) || (isa<Constant>(V) && !isa<GlobalValue>(V)) ||
+            isa<InlineAsm>(V))
+          EnumerateValue(V);
       }
       if (auto *SVI = dyn_cast<ShuffleVectorInst>(&I))
         EnumerateValue(SVI->getShuffleMaskForBitcode());

@@ -7,15 +7,18 @@
 // Modified by Mac-Neutron (2026): copied from
 // lib/Target/DirectX/DXILWriter/DXILBitcodeWriter.cpp at llvmorg-23.1.4 for
 // the AIR writer; namespace llvm::air; every type is written in its typed form
-// (AIRModuleTypes: the table's types, shadow structs under their original
-// names), never an i8* default, and an opaque pointer in the type table is an
-// error; an air* triple keeps its triple and data layout, and a pointer load
-// its typed type (Phase 0 spike, 02e8d34); no debug info (a module with any
-// is an error), no summary, string table or use-list code. LLVM 15's
-// encodings where the 3.7 layout loses meaning: attribute kinds, memory and
-// captures, fast-math flags, unnamed_addr, poison, freeze, fneg, call markers,
-// atomics' types and alignment, alloca, the identification block, source file
-// name, sync scope names, module hash and Darwin wrapper. LLVM 23-only
+// and every operand as its typed operand (AIRPointerTypes: pointee types from
+// the table, refs and derivation, casts and synthetic typed constants; shadow
+// structs under their original names), never an i8* default, and an opaque
+// pointer in the type table is an error; an air* triple keeps its triple and
+// data layout, and a pointer load its typed type (Phase 0 spike, 02e8d34); no
+// debug info (a module with any is an error), no summary, string table or
+// use-list code. Only the llvm.* intrinsics on LLVM15Intrinsics are written
+// (P13). LLVM 15's encodings where the 3.7 layout loses meaning: attribute
+// kinds, memory and captures, fast-math flags, unnamed_addr, poison, freeze,
+// fneg, call markers, atomics' types and alignment, alloca, the
+// identification block, source file name, sync scope names, module hash and
+// Darwin wrapper. LLVM 23-only
 // attributes and flags are dropped from the module first and counted; what
 // LLVM 15 cannot hold is an error, never an llvm_unreachable or assert.
 //
@@ -26,6 +29,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AIRBitcodeWriter.h"
+#include "AIRPointerTypes.h"
 #include "AIRTypes.h"
 #include "AIRValueEnumerator.h"
 #include "llvm/ADT/DenseMap.h"
@@ -112,8 +116,8 @@ class AIRBitcodeWriter {
   /// The Module to write to bitcode.
   const Module &M;
 
-  /// The typed type of every value.
-  const AIRModuleTypes &Types;
+  /// The typed type of every value, and each use's typed operand.
+  const AIRPointerTypes &Types;
 
   /// Enumerates ids for all values in the module.
   ValueEnumerator VE;
@@ -130,7 +134,7 @@ class AIRBitcodeWriter {
   }
 
 public:
-  AIRBitcodeWriter(const Module &M, const AIRModuleTypes &Types,
+  AIRBitcodeWriter(const Module &M, const AIRPointerTypes &Types,
                    BitstreamWriter &Stream, Type *LateType)
       : Stream(Stream), M(M), Types(Types), VE(M, Types), LateType(LateType) {
   }
@@ -309,7 +313,7 @@ unsigned AIRBitcodeWriter::getEncodedBinaryOpcode(unsigned Opcode) {
 }
 
 unsigned AIRBitcodeWriter::getTypeID(Type *T, const Value *V) {
-  return VE.getTypeID(V ? Types.typeOf(V) : Types.form(T));
+  return VE.getTypeID(V ? Types.typedTypeOf(V) : Types.form(T));
 }
 
 unsigned AIRBitcodeWriter::getGlobalObjectValueTypeID(Type *T,
@@ -1200,8 +1204,11 @@ void AIRBitcodeWriter::writeModuleInfo() {
         GV.getType()->getAddressSpace() << 2 | 2 |
         (GV.isConstant() ? 1 : 0)); // HLSL Change - bitwise | was used with
                                     // unsigned int and bool
-    Vals.push_back(
-        GV.isDeclaration() ? 0 : (VE.getValueID(GV.getInitializer()) + 1));
+    Vals.push_back(GV.isDeclaration()
+                       ? 0
+                       : (VE.getValueID(
+                              Types.typedOperand(GV.getOperandUse(0))) +
+                          1));
     Vals.push_back(getEncodedLinkage(GV));
     Vals.push_back(getEncodedAlign(GV.getAlign()));
     Vals.push_back(GV.hasSection() ? SectionMap[std::string(GV.getSection())]
@@ -1260,7 +1267,7 @@ void AIRBitcodeWriter::writeModuleInfo() {
   for (const GlobalAlias &A : M.aliases()) {
     // ALIAS: [alias type, aliasee val#, linkage, visibility]
     Vals.push_back(getTypeID(A.getValueType(), &A));
-    Vals.push_back(VE.getValueID(A.getAliasee()));
+    Vals.push_back(VE.getValueID(Types.typedOperand(A.getOperandUse(0))));
     Vals.push_back(getEncodedLinkage(A));
     Vals.push_back(getEncodedVisibility(A));
     Vals.push_back(getEncodedDLLStorageClass(A));
@@ -1506,12 +1513,43 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
     const Value *V = Vals[i].first;
     // If we need to switch types, do so now: typed types, so constants of one
     // opaque type at several typed types each get their own SETTYPE.
-    if (Types.typeOf(V) != LastTy) {
-      LastTy = Types.typeOf(V);
+    if (Types.typedTypeOf(V) != LastTy) {
+      LastTy = Types.typedTypeOf(V);
       Record.push_back(VE.getTypeID(LastTy));
       Stream.EmitRecord(bitc::CST_CODE_SETTYPE, Record,
                         CONSTANTS_SETTYPE_ABBREV);
       Record.clear();
+    }
+
+    // A synthetic typed constant (P6): a bitcast, or its constant at its
+    // typed type (the SETTYPE above).
+    if (const AIRPointerTypes::Synthetic *S = Types.synthetic(V)) {
+      unsigned Code = 0, AbbrevToUse = 0;
+      auto *CE = dyn_cast<ConstantExpr>(S->C);
+      if (S->Cast || (CE && CE->isCast())) {
+        Code = bitc::CST_CODE_CE_CAST;
+        Record.push_back(S->Cast ? unsigned(bitc::CAST_BITCAST)
+                                 : getEncodedCastOpcode(CE->getOpcode()));
+        Record.push_back(VE.getTypeID(Types.typedTypeOf(S->Ops[0])));
+        Record.push_back(VE.getValueID(S->Ops[0]));
+        AbbrevToUse = CONSTANTS_CE_CAST_Abbrev;
+      } else if (isa<PoisonValue>(S->C)) {
+        Code = bitc::CST_CODE_POISON;
+      } else if (isa<UndefValue>(S->C)) {
+        Code = bitc::CST_CODE_UNDEF;
+      } else if (S->C->isNullValue()) {
+        Code = bitc::CST_CODE_NULL;
+      } else if (isa<ConstantAggregate>(S->C)) {
+        Code = bitc::CST_CODE_AGGREGATE;
+        for (const Value *Op : S->Ops)
+          Record.push_back(VE.getValueID(Op));
+        AbbrevToUse = AggregateAbbrev;
+      } else {
+        fail("constant: a typed instance with no LLVM 15 encoding");
+      }
+      Stream.EmitRecord(Code, Record, AbbrevToUse);
+      Record.clear();
+      continue;
     }
 
     if (const InlineAsm *IA = dyn_cast<InlineAsm>(V)) {
@@ -1533,6 +1571,9 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       continue;
     }
     const Constant *C = cast<Constant>(V);
+    auto Op = [&](unsigned N) {
+      return Types.typedOperand(C->getOperandUse(N));
+    };
     unsigned Code = -1U;
     unsigned AbbrevToUse = 0;
     if (C->isNullValue()) {
@@ -1639,8 +1680,8 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
     } else if (isa<ConstantArray>(C) || isa<ConstantStruct>(C) ||
                isa<ConstantVector>(C)) {
       Code = bitc::CST_CODE_AGGREGATE;
-      for (const Value *Op : C->operands())
-        Record.push_back(VE.getValueID(Op));
+      for (unsigned N = 0, E = C->getNumOperands(); N != E; ++N)
+        Record.push_back(VE.getValueID(Op(N)));
       AbbrevToUse = AggregateAbbrev;
     } else if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(C)) {
       switch (CE->getOpcode()) {
@@ -1651,9 +1692,8 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
             fail(std::string("constant ") + CE->getOpcodeName() +
                  ": no LLVM 15 encoding");
           Record.push_back(getEncodedCastOpcode(CE->getOpcode()));
-          Record.push_back(
-              getTypeID(C->getOperand(0)->getType(), C->getOperand(0)));
-          Record.push_back(VE.getValueID(C->getOperand(0)));
+          Record.push_back(getTypeID(Op(0)->getType(), Op(0)));
+          Record.push_back(VE.getValueID(Op(0)));
           AbbrevToUse = CONSTANTS_CE_CAST_Abbrev;
         } else {
           if (!Instruction::isBinaryOp(CE->getOpcode()) ||
@@ -1665,8 +1705,8 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
           }
           Code = bitc::CST_CODE_CE_BINOP;
           Record.push_back(getEncodedBinaryOpcode(CE->getOpcode()));
-          Record.push_back(VE.getValueID(C->getOperand(0)));
-          Record.push_back(VE.getValueID(C->getOperand(1)));
+          Record.push_back(VE.getValueID(Op(0)));
+          Record.push_back(VE.getValueID(Op(1)));
           uint64_t Flags = getOptimizationFlags(CE);
           if (Flags != 0)
             Record.push_back(Flags);
@@ -1677,33 +1717,35 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
         const auto *GO = cast<GEPOperator>(C);
         if (GO->isInBounds())
           Code = bitc::CST_CODE_CE_INBOUNDS_GEP;
-        Record.push_back(VE.getTypeID(Types.sourceType(*GO)));
+        // Its base must point to its typed source, as prepared (P6); a
+        // constant no use prepared (one only metadata holds) may not.
+        Type *Src = Types.sourceType(*GO);
+        auto *Base = dyn_cast<TypedPointerType>(
+            Types.typedTypeOf(Op(0))->getScalarType());
+        if (!Base || Base->getElementType() != Src)
+          fail("constant getelementptr: its base is not typed as its "
+               "source " +
+               typeName(Src));
+        Record.push_back(VE.getTypeID(Src));
         for (unsigned i = 0, e = CE->getNumOperands(); i != e; ++i) {
-          Record.push_back(
-              getTypeID(C->getOperand(i)->getType(), C->getOperand(i)));
-          Record.push_back(VE.getValueID(C->getOperand(i)));
+          Record.push_back(getTypeID(Op(i)->getType(), Op(i)));
+          Record.push_back(VE.getValueID(Op(i)));
         }
         break;
       }
-      case Instruction::Select:
-        Code = bitc::CST_CODE_CE_SELECT;
-        Record.push_back(VE.getValueID(C->getOperand(0)));
-        Record.push_back(VE.getValueID(C->getOperand(1)));
-        Record.push_back(VE.getValueID(C->getOperand(2)));
-        break;
       case Instruction::ExtractElement:
         Code = bitc::CST_CODE_CE_EXTRACTELT;
-        Record.push_back(getTypeID(C->getOperand(0)->getType()));
-        Record.push_back(VE.getValueID(C->getOperand(0)));
-        Record.push_back(getTypeID(C->getOperand(1)->getType()));
-        Record.push_back(VE.getValueID(C->getOperand(1)));
+        Record.push_back(getTypeID(Op(0)->getType(), Op(0)));
+        Record.push_back(VE.getValueID(Op(0)));
+        Record.push_back(getTypeID(Op(1)->getType(), Op(1)));
+        Record.push_back(VE.getValueID(Op(1)));
         break;
       case Instruction::InsertElement:
         Code = bitc::CST_CODE_CE_INSERTELT;
-        Record.push_back(VE.getValueID(C->getOperand(0)));
-        Record.push_back(VE.getValueID(C->getOperand(1)));
-        Record.push_back(getTypeID(C->getOperand(2)->getType()));
-        Record.push_back(VE.getValueID(C->getOperand(2)));
+        Record.push_back(VE.getValueID(Op(0)));
+        Record.push_back(VE.getValueID(Op(1)));
+        Record.push_back(getTypeID(Op(2)->getType(), Op(2)));
+        Record.push_back(VE.getValueID(Op(2)));
         break;
       case Instruction::ShuffleVector:
         // If the return type and argument types are the same, this is a
@@ -1714,11 +1756,11 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
           Code = bitc::CST_CODE_CE_SHUFFLEVEC;
         } else {
           Code = bitc::CST_CODE_CE_SHUFVEC_EX;
-          Record.push_back(getTypeID(C->getOperand(0)->getType()));
+          Record.push_back(getTypeID(Op(0)->getType(), Op(0)));
         }
-        Record.push_back(VE.getValueID(C->getOperand(0)));
-        Record.push_back(VE.getValueID(C->getOperand(1)));
-        Record.push_back(VE.getValueID(C->getOperand(2)));
+        Record.push_back(VE.getValueID(Op(0)));
+        Record.push_back(VE.getValueID(Op(1)));
+        Record.push_back(VE.getValueID(Op(2)));
         break;
       }
     } else if (const BlockAddress *BA = dyn_cast<BlockAddress>(C)) {
@@ -1797,6 +1839,10 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   unsigned Code = 0;
   unsigned AbbrevToUse = 0;
   VE.setInstructionID(&I);
+  // Operands as written: casts are in the module, typed constants stand in.
+  auto Op = [&](unsigned N) {
+    return Types.typedOperand(I.getOperandUse(N));
+  };
   // P17: an opcode the records cannot hold is an error naming it, never a
   // record written from the wrong layout. lowerToLLVM15 refuses these first.
   auto Unencodable = [&] {
@@ -1810,7 +1856,7 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
       if (getEncodedCastOpcode(I.getOpcode()) == ~0U)
         return Unencodable();
       Code = bitc::FUNC_CODE_INST_CAST;
-      if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+      if (!pushValueAndType(Op(0), InstID, Vals))
         AbbrevToUse = (unsigned)FUNCTION_INST_CAST_ABBREV;
       Vals.push_back(getTypeID(I.getType(), &I));
       Vals.push_back(getEncodedCastOpcode(I.getOpcode()));
@@ -1819,9 +1865,9 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
           getEncodedBinaryOpcode(I.getOpcode()) == ~0U)
         return Unencodable();
       Code = bitc::FUNC_CODE_INST_BINOP;
-      if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+      if (!pushValueAndType(Op(0), InstID, Vals))
         AbbrevToUse = (unsigned)FUNCTION_INST_BINOP_ABBREV;
-      pushValue(I.getOperand(1), InstID, Vals);
+      pushValue(Op(1), InstID, Vals);
       Vals.push_back(getEncodedBinaryOpcode(I.getOpcode()));
       uint64_t Flags = getOptimizationFlags(&I);
       if (Flags != 0) {
@@ -1834,7 +1880,7 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
 
   case Instruction::FNeg: {
     Code = bitc::FUNC_CODE_INST_UNOP;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
     Vals.push_back(getEncodedUnaryOpcode(I.getOpcode()));
     uint64_t Flags = getOptimizationFlags(&I);
     if (Flags != 0)
@@ -1843,7 +1889,7 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   }
   case Instruction::Freeze:
     Code = bitc::FUNC_CODE_INST_FREEZE;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
     break;
 
   case Instruction::GetElementPtr: {
@@ -1853,29 +1899,29 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Vals.push_back(GEPInst.isInBounds());
     Vals.push_back(VE.getTypeID(Types.sourceType(cast<GEPOperator>(I))));
     for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i)
-      pushValueAndType(I.getOperand(i), InstID, Vals);
+      pushValueAndType(Op(i), InstID, Vals);
     break;
   }
   case Instruction::ExtractValue: {
     Code = bitc::FUNC_CODE_INST_EXTRACTVAL;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
     const ExtractValueInst *EVI = cast<ExtractValueInst>(&I);
     Vals.append(EVI->idx_begin(), EVI->idx_end());
     break;
   }
   case Instruction::InsertValue: {
     Code = bitc::FUNC_CODE_INST_INSERTVAL;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
-    pushValueAndType(I.getOperand(1), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
+    pushValueAndType(Op(1), InstID, Vals);
     const InsertValueInst *IVI = cast<InsertValueInst>(&I);
     Vals.append(IVI->idx_begin(), IVI->idx_end());
     break;
   }
   case Instruction::Select: {
     Code = bitc::FUNC_CODE_INST_VSELECT;
-    pushValueAndType(I.getOperand(1), InstID, Vals);
-    pushValue(I.getOperand(2), InstID, Vals);
-    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(Op(1), InstID, Vals);
+    pushValue(Op(2), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
     uint64_t Flags = getOptimizationFlags(&I);
     if (Flags != 0)
       Vals.push_back(Flags);
@@ -1883,19 +1929,19 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   }
   case Instruction::ExtractElement:
     Code = bitc::FUNC_CODE_INST_EXTRACTELT;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
-    pushValueAndType(I.getOperand(1), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
+    pushValueAndType(Op(1), InstID, Vals);
     break;
   case Instruction::InsertElement:
     Code = bitc::FUNC_CODE_INST_INSERTELT;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
-    pushValue(I.getOperand(1), InstID, Vals);
-    pushValueAndType(I.getOperand(2), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
+    pushValue(Op(1), InstID, Vals);
+    pushValueAndType(Op(2), InstID, Vals);
     break;
   case Instruction::ShuffleVector:
     Code = bitc::FUNC_CODE_INST_SHUFFLEVEC;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
-    pushValue(I.getOperand(1), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
+    pushValue(Op(1), InstID, Vals);
     pushValue(cast<ShuffleVectorInst>(&I)->getShuffleMaskForBitcode(), InstID,
               Vals);
     break;
@@ -1903,8 +1949,8 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   case Instruction::FCmp: {
     // compare returning Int1Ty or vector of Int1Ty
     Code = bitc::FUNC_CODE_INST_CMP2;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
-    pushValue(I.getOperand(1), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
+    pushValue(Op(1), InstID, Vals);
     Vals.push_back(cast<CmpInst>(I).getPredicate());
     uint64_t Flags = getOptimizationFlags(&I);
     if (Flags != 0)
@@ -1918,11 +1964,11 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     if (NumOperands == 0)
       AbbrevToUse = (unsigned)FUNCTION_INST_RET_VOID_ABBREV;
     else if (NumOperands == 1) {
-      if (!pushValueAndType(I.getOperand(0), InstID, Vals))
+      if (!pushValueAndType(Op(0), InstID, Vals))
         AbbrevToUse = (unsigned)FUNCTION_INST_RET_VAL_ABBREV;
     } else {
       for (unsigned i = 0, e = NumOperands; i != e; ++i)
-        pushValueAndType(I.getOperand(i), InstID, Vals);
+        pushValueAndType(Op(i), InstID, Vals);
     }
   } break;
   case Instruction::UncondBr:
@@ -1949,16 +1995,16 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   } break;
   case Instruction::IndirectBr:
     Code = bitc::FUNC_CODE_INST_INDIRECTBR;
-    Vals.push_back(getTypeID(I.getOperand(0)->getType(), I.getOperand(0)));
+    Vals.push_back(getTypeID(Op(0)->getType(), Op(0)));
     // Encode the address operand as relative, but not the basic blocks.
-    pushValue(I.getOperand(0), InstID, Vals);
+    pushValue(Op(0), InstID, Vals);
     for (unsigned i = 1, e = I.getNumOperands(); i != e; ++i)
-      Vals.push_back(VE.getValueID(I.getOperand(i)));
+      Vals.push_back(VE.getValueID(Op(i)));
     break;
 
   case Instruction::Invoke: {
     const InvokeInst *II = cast<InvokeInst>(&I);
-    const Value *Callee = II->getCalledOperand();
+    const Value *Callee = Types.typedOperand(II->getCalledOperandUse());
     FunctionType *FTy = II->getFunctionType();
     Code = bitc::FUNC_CODE_INST_INVOKE;
 
@@ -1971,19 +2017,19 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
 
     // Emit value #'s for the fixed parameters.
     for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i)
-      pushValue(I.getOperand(i), InstID, Vals); // fixed param.
+      pushValue(Op(i), InstID, Vals); // fixed param.
 
     // Emit type/value pairs for varargs params.
     if (FTy->isVarArg()) {
       for (unsigned i = FTy->getNumParams(), e = I.getNumOperands() - 3; i != e;
            ++i)
-        pushValueAndType(I.getOperand(i), InstID, Vals); // vararg
+        pushValueAndType(Op(i), InstID, Vals); // vararg
     }
     break;
   }
   case Instruction::Resume:
     Code = bitc::FUNC_CODE_INST_RESUME;
-    pushValueAndType(I.getOperand(0), InstID, Vals);
+    pushValueAndType(Op(0), InstID, Vals);
     break;
   case Instruction::Unreachable:
     Code = bitc::FUNC_CODE_INST_UNREACHABLE;
@@ -1999,7 +2045,7 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     SmallVector<uint64_t, 128> Vals64;
     Vals64.push_back(getTypeID(PN.getType(), &PN));
     for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; ++i) {
-      pushValueSigned(PN.getIncomingValue(i), InstID, Vals64);
+      pushValueSigned(Op(i), InstID, Vals64);
       Vals64.push_back(VE.getValueID(PN.getIncomingBlock(i)));
     }
     uint64_t Flags = getOptimizationFlags(&I);
@@ -2022,7 +2068,7 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
         Vals.push_back(LandingPadInst::Catch);
       else
         Vals.push_back(LandingPadInst::Filter);
-      pushValueAndType(LP.getClause(I), InstID, Vals);
+      pushValueAndType(Op(I), InstID, Vals);
     }
     break;
   }
@@ -2031,8 +2077,8 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Code = bitc::FUNC_CODE_INST_ALLOCA;
     const AllocaInst &AI = cast<AllocaInst>(I);
     Vals.push_back(VE.getTypeID(Types.allocatedType(AI)));
-    Vals.push_back(getTypeID(I.getOperand(0)->getType()));
-    Vals.push_back(VE.getValueID(I.getOperand(0))); // size.
+    Vals.push_back(getTypeID(Op(0)->getType()));
+    Vals.push_back(VE.getValueID(Op(0))); // size.
     // As LLVM 15 packs it: alignments past 2^30 too, and swifterror.
     using APV = AllocaPackedValues;
     unsigned Record = 0;
@@ -2053,10 +2099,10 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   case Instruction::Load:
     if (cast<LoadInst>(I).isAtomic()) {
       Code = bitc::FUNC_CODE_INST_LOADATOMIC;
-      pushValueAndType(I.getOperand(0), InstID, Vals);
+      pushValueAndType(Op(0), InstID, Vals);
     } else {
       Code = bitc::FUNC_CODE_INST_LOAD;
-      if (!pushValueAndType(I.getOperand(0), InstID, Vals)) // ptr
+      if (!pushValueAndType(Op(0), InstID, Vals)) // ptr
         AbbrevToUse = (unsigned)FUNCTION_INST_LOAD_ABBREV;
     }
     // A pointer load's type is the loaded value's typed pointer (02e8d34).
@@ -2073,8 +2119,8 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
       Code = bitc::FUNC_CODE_INST_STOREATOMIC;
     else
       Code = bitc::FUNC_CODE_INST_STORE;
-    pushValueAndType(I.getOperand(1), InstID, Vals); // ptrty + ptr
-    pushValueAndType(I.getOperand(0), InstID, Vals); // valty + val
+    pushValueAndType(Op(1), InstID, Vals); // ptrty + ptr
+    pushValueAndType(Op(0), InstID, Vals); // valty + val
     Vals.push_back(Log2(cast<StoreInst>(I).getAlign()) + 1);
     Vals.push_back(cast<StoreInst>(I).isVolatile());
     if (cast<StoreInst>(I).isAtomic()) {
@@ -2085,9 +2131,9 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     break;
   case Instruction::AtomicCmpXchg:
     Code = bitc::FUNC_CODE_INST_CMPXCHG;
-    pushValueAndType(I.getOperand(0), InstID, Vals); // ptrty + ptr
-    pushValueAndType(I.getOperand(1), InstID, Vals); // cmp.
-    pushValue(I.getOperand(2), InstID, Vals);        // newval.
+    pushValueAndType(Op(0), InstID, Vals); // ptrty + ptr
+    pushValueAndType(Op(1), InstID, Vals); // cmp.
+    pushValue(Op(2), InstID, Vals);        // newval.
     Vals.push_back(cast<AtomicCmpXchgInst>(I).isVolatile());
     Vals.push_back(
         getEncodedOrdering(cast<AtomicCmpXchgInst>(I).getSuccessOrdering()));
@@ -2104,8 +2150,8 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     if (getEncodedRMWOperation(cast<AtomicRMWInst>(I).getOperation()) == ~0U)
       return Unencodable();
     Code = bitc::FUNC_CODE_INST_ATOMICRMW;
-    pushValueAndType(I.getOperand(0), InstID, Vals); // ptrty + ptr
-    pushValueAndType(I.getOperand(1), InstID, Vals); // valty + val
+    pushValueAndType(Op(0), InstID, Vals); // ptrty + ptr
+    pushValueAndType(Op(1), InstID, Vals); // valty + val
     Vals.push_back(
         getEncodedRMWOperation(cast<AtomicRMWInst>(I).getOperation()));
     Vals.push_back(cast<AtomicRMWInst>(I).isVolatile());
@@ -2137,29 +2183,30 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     if (Flags != 0)
       Vals.push_back(Flags);
     Vals.push_back(VE.getTypeID(Types.callType(CI)));
-    pushValueAndType(CI.getCalledOperand(), InstID, Vals); // Callee
+    pushValueAndType(Types.typedOperand(CI.getCalledOperandUse()), InstID,
+                     Vals); // Callee
 
     // Emit value #'s for the fixed parameters.
     for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i) {
       // Check for labels (can happen with asm labels).
       if (FTy->getParamType(i)->isLabelTy())
-        Vals.push_back(VE.getValueID(CI.getArgOperand(i)));
+        Vals.push_back(VE.getValueID(Op(i)));
       else
-        pushValue(CI.getArgOperand(i), InstID, Vals); // fixed param.
+        pushValue(Op(i), InstID, Vals); // fixed param.
     }
 
     // Emit type/value pairs for varargs params.
     if (FTy->isVarArg()) {
       for (unsigned i = FTy->getNumParams(), e = CI.arg_size(); i != e; ++i)
-        pushValueAndType(CI.getArgOperand(i), InstID, Vals); // varargs
+        pushValueAndType(Op(i), InstID, Vals); // varargs
     }
     break;
   }
   case Instruction::VAArg:
     Code = bitc::FUNC_CODE_INST_VAARG;
-    Vals.push_back(getTypeID(I.getOperand(0)->getType(),
-                             I.getOperand(0)));    // valistty
-    pushValue(I.getOperand(0), InstID, Vals);      // valist.
+    Vals.push_back(getTypeID(Op(0)->getType(),
+                             Op(0)));    // valistty
+    pushValue(Op(0), InstID, Vals);      // valist.
     Vals.push_back(getTypeID(I.getType(), &I));    // restype.
     break;
   }
@@ -2641,6 +2688,13 @@ static constexpr Attribute::AttrKind GuaranteeOnly[] = {
     Attribute::NoFPClass,    Attribute::Range,
     Attribute::Writable};
 
+/// The llvm.* intrinsics the writer writes (P13), mangled: each name's LLVM
+/// 15 signature (L15/include/llvm/IR/Intrinsics.td) was checked equal to LLVM
+/// 23's when a controller ruling added it. LLVM 15 reads any other llvm.*
+/// declaration as a plain function, so only Metal would decide: an error.
+static constexpr StringLiteral LLVM15Intrinsics[] = {"llvm.umax.i64",
+                                                     "llvm.usub.sat.i32"};
+
 /// AS with what LLVM 15 cannot hold dropped (guarantee-only kinds, captures
 /// other than none) or weakened (memory(...) to its strongest LLVM 15
 /// cover), each counted once; any other kind is an error.
@@ -2777,6 +2831,24 @@ lowerToLLVM15(Module &M, AIRWriteReport &R,
               SmallVectorImpl<std::pair<Function *, AttributeList>>
                   &ReaderDefined) {
   LLVMContext &C = M.getContext();
+  for (Function &F : M) {
+    if (!F.getName().starts_with("llvm.") ||
+        is_contained(LLVM15Intrinsics, F.getName()))
+      continue;
+    std::string In;
+    for (Function &G : M) {
+      for (Instruction &I : instructions(G))
+        if (auto *CB = dyn_cast<CallBase>(&I);
+            CB && CB->getCalledOperand() == &F) {
+          In = (" (in @" + G.getName() + ")").str();
+          break;
+        }
+      if (!In.empty())
+        break;
+    }
+    return error("intrinsic @" + F.getName() +
+                 ": not on the writer's list of LLVM 15 intrinsics" + In);
+  }
   // Per attribute group (index, set), as the bitcode keys them: each
   // dropped entry is counted once however many lists share the group.
   DenseMap<std::pair<unsigned, AttributeSet>, AttributeSet> Lowered;
@@ -2991,7 +3063,7 @@ Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
   });
   if (Error E = lowerToLLVM15(M, *R, ReaderDefined))
     return E;
-  Expected<AIRModuleTypes> Types = AIRModuleTypes::run(M, T);
+  Expected<AIRPointerTypes> Types = AIRPointerTypes::run(M, T, *R);
   if (!Types)
     return Types.takeError();
 

@@ -20,6 +20,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBufferRef.h"
@@ -28,11 +29,6 @@
 
 namespace llvm {
 
-class AllocaInst;
-class CallBase;
-class Function;
-class GEPOperator;
-class GlobalVariable;
 class Module;
 class Value;
 
@@ -58,6 +54,11 @@ std::string typeName(const Type *T);
 /// Whether T holds an opaque pointer outside identified structs.
 bool hasOpaquePointer(Type *T);
 
+/// T with F applied to each type it contains (pointee, elements, return and
+/// parameters), or T itself if none changed. Identified structs are F's
+/// business; their bodies are not visited.
+Type *mapContained(Type *T, function_ref<Type *(Type *)> F);
+
 class AIRTypeTable {
 public:
   static Expected<AIRTypeTable> build(Module &M, const AIRTypeInput &In);
@@ -76,6 +77,10 @@ public:
   /// The name a struct is written under: a shadow's is its original's.
   StringRef nameOf(const StructType *S) const;
 
+  /// T as LLVM prints it, shadows under their originals' names (error and
+  /// --explain text).
+  std::string print(Type *T) const;
+
   unsigned refsFilled() const { return RefsFilled; }
 
 private:
@@ -84,32 +89,6 @@ private:
   DenseMap<const StructType *, StructType *> Originals;  // shadow -> original
   mutable DenseMap<Type *, Type *> FormCache;
   unsigned RefsFilled = 0;
-};
-
-/// The typed type of every value the writer writes. In this version from the
-/// table only: a value with a pointer and no entry is an error.
-class AIRModuleTypes {
-public:
-  static Expected<AIRModuleTypes> run(const Module &M, const AIRTypeTable &T);
-
-  /// V's typed type. For a constant, its type in typed form.
-  Type *typeOf(const Value *V) const;
-  Type *form(Type *T) const { return Table->typedForm(T); }
-  FunctionType *functionType(const Function &F) const;
-  Type *valueType(const GlobalVariable &G) const;
-  /// A GEP's typed source element type.
-  Type *sourceType(const GEPOperator &G) const;
-  Type *allocatedType(const AllocaInst &AI) const;
-  /// The typed function type a call is written with.
-  FunctionType *callType(const CallBase &CB) const;
-  StringRef nameOf(const StructType *S) const { return Table->nameOf(S); }
-
-private:
-  const AIRTypeTable *Table = nullptr;
-  DenseMap<const Value *, Type *> Typed;
-  /// Function: typed function type; global: typed value type; GEP: typed
-  /// source type; alloca: typed allocated type; call: typed function type.
-  DenseMap<const Value *, Type *> Aux;
 };
 
 } // namespace air

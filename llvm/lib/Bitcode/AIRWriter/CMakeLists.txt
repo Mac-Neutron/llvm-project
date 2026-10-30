@@ -1,6 +1,7 @@
 # Added by Mac-Neutron (2026): the typed-pointer AIR writer.
 add_llvm_component_library(LLVMAIRBitWriter
   AIRBitcodeWriter.cpp
+  AIRPointerTypes.cpp
   AIRTypedRefs.cpp
   AIRTypes.cpp
   AIRValueEnumerator.cpp

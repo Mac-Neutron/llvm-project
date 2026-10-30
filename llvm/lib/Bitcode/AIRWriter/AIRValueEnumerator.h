@@ -7,8 +7,9 @@
 // Modified by Mac-Neutron (2026): copied from
 // lib/Target/DirectX/DXILWriter/DXILValueEnumerator.h at llvmorg-23.1.4 for the
 // AIR writer; namespace llvm::air; no DXIL debug info map; types are numbered
-// in their typed form (AIRModuleTypes) only; a lookup that misses records an
-// error (error()) and returns 0 instead of dereferencing end().
+// in their typed form (AIRPointerTypes) only, and operands as their typed
+// operands (synthetic typed constants included); a lookup that misses
+// records an error (error()) and returns 0 instead of dereferencing end().
 //
 //===----------------------------------------------------------------------===//
 //
@@ -50,7 +51,7 @@ class ValueSymbolTable;
 
 namespace air {
 
-class AIRModuleTypes;
+class AIRPointerTypes;
 
 class ValueEnumerator {
 public:
@@ -146,14 +147,14 @@ private:
   unsigned FirstInstID;
 
   /// The typed type of every value; the only source of enumerated types.
-  const AIRModuleTypes &Typed;
+  const AIRPointerTypes &Typed;
 
   /// The first lookup that missed (P17: never dereference end()).
   mutable std::string Err;
   void miss(const Twine &What) const;
 
 public:
-  ValueEnumerator(const Module &M, const AIRModuleTypes &Typed);
+  ValueEnumerator(const Module &M, const AIRPointerTypes &Typed);
   ValueEnumerator(const ValueEnumerator &) = delete;
   ValueEnumerator &operator=(const ValueEnumerator &) = delete;
 

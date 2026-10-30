@@ -2,8 +2,9 @@
 ; an abort, the same with assertions off (P17): a scalable vector, a type
 ; outside the type table's switch (bfloat), callbr and the other opcodes the
 ; writer has no case for, ptrtoaddr, an atomicrmw operation LLVM 15 lacks,
-; operand bundles, debug info, and a typed type the enumerator never saw
-; (made after enumeration, through --self-test-late-type).
+; operand bundles, debug info, a typed type the enumerator never saw (made
+; after enumeration, through --self-test-late-type), and a constant kind
+; outside the constants switch (dso_local_equivalent).
 ; RUN: split-file %s %t
 ; RUN: not llvm-air-write %t/scalable.ll -o %t/o.bc 2>&1 | FileCheck %s --check-prefix=SCALABLE
 ; RUN: not llvm-air-write %t/bfloat.ll -o %t/o.bc 2>&1 | FileCheck %s --check-prefix=BFLOAT
@@ -13,6 +14,7 @@
 ; RUN: not llvm-air-write %t/bundle.ll -o %t/o.bc 2>&1 | FileCheck %s --check-prefix=BUNDLE
 ; RUN: not llvm-air-write %t/debuginfo.ll -o %t/o.bc 2>&1 | FileCheck %s --check-prefix=DEBUGINFO
 ; RUN: not llvm-air-write --self-test-late-type 2>&1 | FileCheck %s --check-prefix=LATE
+; RUN: not llvm-air-write %t/constkind.ll -o %t/o.bc 2>&1 | FileCheck %s --check-prefix=CONSTKIND
 
 ; SCALABLE: error: type <vscale x 4 x i32>: a scalable vector has no LLVM 15 AIR encoding
 ; BFLOAT: error: type bfloat: no LLVM 15 AIR encoding
@@ -21,7 +23,8 @@
 ; RMW: error: atomicrmw uinc_wrap %o: no LLVM 15 encoding (in @k)
 ; BUNDLE: error: call: operand bundles are not written (in @k)
 ; DEBUGINFO: error: debug info: a location in @k: AIR carries none
-; LATE: error: type table: typedptr(i8, 7) was not enumerated
+; LATE: error: type table: i8 addrspace(7)* was not enumerated
+; CONSTKIND: error: constant ptr dso_local_equivalent @f: a kind with no LLVM 15 encoding
 ; SCALABLE-NOT: stats
 ; BFLOAT-NOT: stats
 ; CALLBR-NOT: stats
@@ -102,3 +105,11 @@ define void @k() !dbg !4 {
 !4 = distinct !DISubprogram(name: "k", scope: !1, file: !1, line: 1, type: !5, unit: !0)
 !5 = !DISubroutineType(types: !{})
 !6 = !DILocation(line: 1, scope: !4)
+;--- constkind.ll
+target triple = "air64-apple-macosx14.0.0"
+
+declare void @f()
+
+define ptr @k() {
+  ret ptr dso_local_equivalent @f
+}

@@ -11,15 +11,13 @@
 #include "AIRTypes.h"
 #include "AIRTypedRefs.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Operator.h"
 #include "llvm/IR/TypedPointerType.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
@@ -31,10 +29,80 @@ static Error error(const Twine &Msg) {
   return createStringError(inconvertibleErrorCode(), Msg);
 }
 
+/// T as LLVM 15 prints it (T addrspace(N)* for a typed pointer; an
+/// identified struct by its name, a shadow by its original's).
+static void printTyped(raw_ostream &OS, const Type *T,
+                       const DenseMap<const StructType *, StructType *> *O) {
+  auto List = [&](ArrayRef<Type *> Ts) {
+    ListSeparator LS;
+    for (Type *E : Ts) {
+      OS << LS;
+      printTyped(OS, E, O);
+    }
+  };
+  switch (T->getTypeID()) {
+  case Type::TypedPointerTyID: {
+    auto *P = cast<TypedPointerType>(T);
+    printTyped(OS, P->getElementType(), O);
+    if (P->getAddressSpace())
+      OS << " addrspace(" << P->getAddressSpace() << ")";
+    OS << '*';
+    return;
+  }
+  case Type::StructTyID: {
+    auto *S = cast<StructType>(T);
+    if (!S->isLiteral()) {
+      const StructType *Named = S;
+      if (O)
+        if (StructType *Orig = O->lookup(S))
+          Named = Orig;
+      Named->print(OS, /*IsForDebug=*/false, /*NoDetails=*/true);
+      return;
+    }
+    OS << (S->isPacked() ? "<{" : "{");
+    if (S->getNumElements()) {
+      OS << ' ';
+      List(S->elements());
+      OS << ' ';
+    }
+    OS << (S->isPacked() ? "}>" : "}");
+    return;
+  }
+  case Type::ArrayTyID: {
+    auto *A = cast<ArrayType>(T);
+    OS << '[' << A->getNumElements() << " x ";
+    printTyped(OS, A->getElementType(), O);
+    OS << ']';
+    return;
+  }
+  case Type::FixedVectorTyID:
+  case Type::ScalableVectorTyID: {
+    auto *V = cast<VectorType>(T);
+    OS << '<' << (isa<ScalableVectorType>(V) ? "vscale x " : "")
+       << V->getElementCount().getKnownMinValue() << " x ";
+    printTyped(OS, V->getElementType(), O);
+    OS << '>';
+    return;
+  }
+  case Type::FunctionTyID: {
+    auto *F = cast<FunctionType>(T);
+    printTyped(OS, F->getReturnType(), O);
+    OS << " (";
+    List(F->params());
+    if (F->isVarArg())
+      OS << (F->getNumParams() ? ", ..." : "...");
+    OS << ')';
+    return;
+  }
+  default:
+    T->print(OS);
+  }
+}
+
 std::string llvm::air::typeName(const Type *T) {
   std::string S;
   raw_string_ostream OS(S);
-  T->print(OS);
+  printTyped(OS, T, nullptr);
   return S;
 }
 
@@ -90,6 +158,10 @@ template <typename Fn> static Type *rebuild(Type *T, Fn F) {
   default:
     return T;
   }
+}
+
+Type *llvm::air::mapContained(Type *T, function_ref<Type *(Type *)> F) {
+  return rebuild(T, F);
 }
 
 static bool isIdentified(Type *T) {
@@ -154,6 +226,13 @@ Type *AIRTypeTable::typedForm(Type *T) const {
 }
 
 Type *AIRTypeTable::erase(Type *T) const { return eraseImpl(T, &Originals); }
+
+std::string AIRTypeTable::print(Type *T) const {
+  std::string S;
+  raw_string_ostream OS(S);
+  printTyped(OS, T, &Originals);
+  return S;
+}
 
 StringRef AIRTypeTable::nameOf(const StructType *S) const {
   if (StructType *Orig = Originals.lookup(S))
@@ -325,168 +404,4 @@ Expected<AIRTypeTable> AIRTypeTable::build(Module &M, const AIRTypeInput &In) {
   for (auto [V, Ty] : Raw)
     T.Entries[V] = T.typedForm(Ty);
   return std::move(T);
-}
-
-Type *AIRModuleTypes::typeOf(const Value *V) const {
-  if (Type *T = Typed.lookup(V))
-    return T;
-  return Table->typedForm(V->getType());
-}
-
-FunctionType *AIRModuleTypes::functionType(const Function &F) const {
-  if (Type *T = Aux.lookup(&F))
-    return cast<FunctionType>(T);
-  return cast<FunctionType>(Table->typedForm(F.getFunctionType()));
-}
-
-Type *AIRModuleTypes::valueType(const GlobalVariable &G) const {
-  if (Type *T = Aux.lookup(&G))
-    return T;
-  return Table->typedForm(G.getValueType());
-}
-
-Type *AIRModuleTypes::sourceType(const GEPOperator &G) const {
-  if (Type *T = Aux.lookup(&G))
-    return T;
-  return Table->typedForm(G.getSourceElementType());
-}
-
-Type *AIRModuleTypes::allocatedType(const AllocaInst &AI) const {
-  if (Type *T = Aux.lookup(&AI))
-    return T;
-  return Table->typedForm(AI.getAllocatedType());
-}
-
-FunctionType *AIRModuleTypes::callType(const CallBase &CB) const {
-  if (Type *T = Aux.lookup(&CB))
-    return cast<FunctionType>(T);
-  return cast<FunctionType>(Table->typedForm(CB.getFunctionType()));
-}
-
-Expected<AIRModuleTypes> AIRModuleTypes::run(const Module &M,
-                                             const AIRTypeTable &T) {
-  AIRModuleTypes R;
-  R.Table = &T;
-  auto Fail = [&M](const Twine &Construct, const Twine &Why,
-                   const Value *In) {
-    return error(Construct + ": " + Why +
-                 (In ? " (in " + str(In, &M) + ")" : std::string()));
-  };
-  // A value whose type holds a pointer needs an entry (or a function's).
-  auto Typed = [&](const Value *V, Type *Ty, const Twine &Construct,
-                   const Value *In) -> Expected<Type *> {
-    if (Type *E = T.entry(V))
-      return E;
-    if (hasOpaquePointer(Ty))
-      return Fail(Construct, "pointer with no typed type", In);
-    return T.typedForm(Ty);
-  };
-  SmallPtrSet<const Constant *, 32> Checked;
-  std::function<Error(const Constant *, const Value *)> CheckConstant =
-      [&](const Constant *C, const Value *In) -> Error {
-    if (isa<GlobalValue>(C) || !Checked.insert(C).second)
-      return Error::success();
-    if (hasOpaquePointer(C->getType()))
-      return Fail("constant " + str(C, &M), "pointer with no typed type", In);
-    for (const Use &Op : C->operands())
-      if (auto *OC = dyn_cast<Constant>(Op.get()))
-        if (Error E = CheckConstant(OC, In))
-          return E;
-    return Error::success();
-  };
-
-  for (const GlobalVariable &G : M.globals()) {
-    Expected<Type *> VT =
-        Typed(&G, G.getValueType(), "global " + str(&G, &M), nullptr);
-    if (!VT)
-      return VT.takeError();
-    R.Aux[&G] = *VT;
-    R.Typed[&G] = TypedPointerType::get(*VT, G.getAddressSpace());
-    if (G.hasInitializer())
-      if (Error E = CheckConstant(G.getInitializer(), &G))
-        return std::move(E);
-  }
-
-  for (const Function &F : M) {
-    auto *FT = cast_or_null<FunctionType>(T.entry(&F));
-    if (!FT) {
-      if (hasOpaquePointer(F.getReturnType()))
-        return Fail("function " + str(&F, &M),
-                    "returns a pointer with no typed type", nullptr);
-      SmallVector<Type *, 8> Params;
-      for (const Argument &A : F.args()) {
-        Expected<Type *> AT =
-            Typed(&A, A.getType(), "argument " + str(&A, &M), &F);
-        if (!AT)
-          return AT.takeError();
-        Params.push_back(*AT);
-      }
-      FT = FunctionType::get(T.typedForm(F.getReturnType()), Params,
-                             F.isVarArg());
-    }
-    for (const Argument &A : F.args()) {
-      Type *PT = FT->getParamType(A.getArgNo());
-      if (Type *AT = T.entry(&A); AT && AT != PT)
-        return Fail("argument " + str(&A, &M),
-                    "its entry " + str(AT) + " is not its function's " +
-                        str(PT),
-                    &F);
-      R.Typed[&A] = PT;
-    }
-    R.Aux[&F] = FT;
-    R.Typed[&F] = TypedPointerType::get(FT, F.getAddressSpace());
-  }
-
-  for (const Function &F : M)
-    for (const Instruction &I : instructions(F)) {
-      auto Construct = [&] {
-        return std::string(I.getOpcodeName()) +
-               (I.getType()->isVoidTy() ? "" : " " + str(&I, &M));
-      };
-      if (!I.getType()->isVoidTy()) {
-        Expected<Type *> IT = Typed(&I, I.getType(), Construct(), &F);
-        if (!IT)
-          return IT.takeError();
-        R.Typed[&I] = *IT;
-      }
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-        Type *Src = GEP->getSourceElementType();
-        if (!hasOpaquePointer(Src)) {
-          R.Aux[&I] = T.typedForm(Src);
-        } else {
-          // The base's typed pointee, when it erases to the source type.
-          auto *P = dyn_cast<TypedPointerType>(
-              R.typeOf(GEP->getPointerOperand()));
-          if (!P || T.erase(P->getElementType()) != Src)
-            return Fail(Construct(),
-                        "its source type holds a pointer its base's typed "
-                        "type does not give",
-                        &F);
-          R.Aux[&I] = P->getElementType();
-        }
-      } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        auto *P = dyn_cast<TypedPointerType>(R.Typed.lookup(&I));
-        if (!P || T.erase(P->getElementType()) != AI->getAllocatedType())
-          return Fail(Construct(),
-                      "its typed type does not point to its allocated type",
-                      &F);
-        R.Aux[&I] = P->getElementType();
-      } else if (auto *CB = dyn_cast<CallBase>(&I)) {
-        auto *Callee = dyn_cast<Function>(CB->getCalledOperand());
-        if (Callee && Callee->getFunctionType() == CB->getFunctionType())
-          R.Aux[&I] = R.functionType(*Callee);
-        else if (!hasOpaquePointer(CB->getFunctionType()))
-          R.Aux[&I] = T.typedForm(CB->getFunctionType());
-        else
-          return Fail(Construct(),
-                      "its function type holds a pointer and is not its "
-                      "callee's",
-                      &F);
-      }
-      for (const Use &Op : I.operands())
-        if (auto *C = dyn_cast<Constant>(Op.get()))
-          if (Error E = CheckConstant(C, &F))
-            return std::move(E);
-    }
-  return std::move(R);
 }

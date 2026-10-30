@@ -1,0 +1,5 @@
+s %argument_buffer_struct { i32 addrspace(2)*, float addrspace(1)* }
+f @k void (%argument_buffer_struct addrspace(2)*)
+c @k 4
+i @k 0 float addrspace(1)* addrspace(2)*
+i @k 1 float addrspace(1)*

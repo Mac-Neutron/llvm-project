@@ -78,6 +78,7 @@ set(LLVM_TEST_DEPENDS
   lli-child-target
   llubi
   llvm-addr2line
+  llvm-air-write # Mac-Neutron: Modified by Mac-Neutron (2026): the AIR writer's tool.
   llvm-ar
   llvm-as
   llvm-bcanalyzer

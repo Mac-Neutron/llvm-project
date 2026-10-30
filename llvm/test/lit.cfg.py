@@ -254,6 +254,7 @@ tools.extend(
         "lli",
         "lli-child-target",
         "llubi",
+        "llvm-air-write",  # Mac-Neutron: Modified by Mac-Neutron (2026): the AIR writer's tool.
         "llvm-ar",
         "llvm-as",
         "llvm-addr2line",

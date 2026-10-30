@@ -11,7 +11,13 @@
 // names), never an i8* default, and an opaque pointer in the type table is an
 // error; an air* triple keeps its triple and data layout, and a pointer load
 // its typed type (Phase 0 spike, 02e8d34); no debug info (a module with any
-// is an error), no summary, string table or use-list code.
+// is an error), no summary, string table or use-list code. LLVM 15's
+// encodings where the 3.7 layout loses meaning: attribute kinds, memory and
+// captures, fast-math flags, unnamed_addr, poison, freeze, fneg, call markers,
+// atomics' types and alignment, alloca, the identification block, source file
+// name, sync scope names, module hash and Darwin wrapper. LLVM 23-only
+// attributes and flags are dropped from the module first and counted; what
+// LLVM 15 cannot hold is an error, never an llvm_unreachable or assert.
 //
 //===----------------------------------------------------------------------===//
 //
@@ -22,10 +28,14 @@
 #include "AIRBitcodeWriter.h"
 #include "AIRTypes.h"
 #include "AIRValueEnumerator.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitcode/BitcodeCommon.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/LLVMBitCodes.h"
 #include "llvm/Bitstream/BitCodes.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
@@ -42,9 +52,11 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -54,9 +66,13 @@
 #include "llvm/IR/UseListOrder.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueSymbolTable.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ModRef.h"
+#include "llvm/Support/SHA1.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include <array>
 
 namespace llvm {
 namespace air {
@@ -105,6 +121,9 @@ class AIRBitcodeWriter {
   /// The first error met while writing; the output is then discarded.
   std::string Err;
 
+  /// llvm-air-write --self-test-late-type: a type never enumerated.
+  Type *LateType;
+
   void fail(const Twine &Msg) {
     if (Err.empty())
       Err = Msg.str();
@@ -112,19 +131,22 @@ class AIRBitcodeWriter {
 
 public:
   AIRBitcodeWriter(const Module &M, const AIRModuleTypes &Types,
-                   BitstreamWriter &Stream)
-      : Stream(Stream), M(M), Types(Types), VE(M, Types) {}
+                   BitstreamWriter &Stream, Type *LateType)
+      : Stream(Stream), M(M), Types(Types), VE(M, Types), LateType(LateType) {
+  }
 
   /// Emit the current module to the bitstream.
   void write();
 
-  const std::string &error() const { return Err; }
+  /// The writer's first error, else the enumerator's first missed lookup.
+  const std::string &error() const { return Err.empty() ? VE.error() : Err; }
 
   static uint64_t getAttrKindEncoding(Attribute::AttrKind Kind);
   static void writeStringRecord(BitstreamWriter &Stream, unsigned Code,
                                 StringRef Str, unsigned AbbrevToUse);
   static void writeIdentificationBlock(BitstreamWriter &Stream);
   static void emitSignedInt64(SmallVectorImpl<uint64_t> &Vals, uint64_t V);
+  static unsigned getEncodedUnnamedAddr(const GlobalValue &GV);
   static void emitWideAPInt(SmallVectorImpl<uint64_t> &Vals, const APInt &A);
 
   static unsigned getEncodedComdatSelectionKind(const Comdat &C);
@@ -142,6 +164,7 @@ public:
 
 private:
   void writeModuleVersion();
+  void writeModuleHash(StringRef View);
 
   void writeAttributeGroupTable();
   void writeAttributeTable();
@@ -203,10 +226,12 @@ using namespace llvm::air;
 /// Begin AIRBitcodeWriter static helpers
 ////////////////////////////////////////////////////////////////////////////////
 
+/// The opcode tables return ~0U for an opcode LLVM 15 has no code for; the
+/// caller makes that an error naming it (P17).
 unsigned AIRBitcodeWriter::getEncodedCastOpcode(unsigned Opcode) {
   switch (Opcode) {
   default:
-    llvm_unreachable("Unknown cast instruction!");
+    return ~0U;
   case Instruction::Trunc:
     return bitc::CAST_TRUNC;
   case Instruction::ZExt:
@@ -239,7 +264,7 @@ unsigned AIRBitcodeWriter::getEncodedCastOpcode(unsigned Opcode) {
 unsigned AIRBitcodeWriter::getEncodedUnaryOpcode(unsigned Opcode) {
   switch (Opcode) {
   default:
-    llvm_unreachable("Unknown binary instruction!");
+    return ~0U;
   case Instruction::FNeg:
     return bitc::UNOP_FNEG;
   }
@@ -248,7 +273,7 @@ unsigned AIRBitcodeWriter::getEncodedUnaryOpcode(unsigned Opcode) {
 unsigned AIRBitcodeWriter::getEncodedBinaryOpcode(unsigned Opcode) {
   switch (Opcode) {
   default:
-    llvm_unreachable("Unknown binary instruction!");
+    return ~0U;
   case Instruction::Add:
   case Instruction::FAdd:
     return bitc::BINOP_ADD;
@@ -299,7 +324,7 @@ unsigned AIRBitcodeWriter::getGlobalObjectValueTypeID(Type *T,
 unsigned AIRBitcodeWriter::getEncodedRMWOperation(AtomicRMWInst::BinOp Op) {
   switch (Op) {
   default:
-    llvm_unreachable("Unknown RMW operation!");
+    return ~0U;
   case AtomicRMWInst::Xchg:
     return bitc::RMW_XCHG;
   case AtomicRMWInst::Add:
@@ -369,10 +394,19 @@ void AIRBitcodeWriter::writeStringRecord(BitstreamWriter &Stream,
   Stream.EmitRecord(Code, Vals, AbbrevToUse);
 }
 
+/// LLVM 15's attribute kind table (L15/lib/Bitcode/Writer/BitcodeWriter.cpp
+/// getAttrKindEncoding), minus the kinds LLVM 23 removed (argmemonly,
+/// inaccessiblememonly, inaccessiblemem_or_argmemonly, nocapture; memory and
+/// captures stand for them). Codes 1-84 are the same in both LLVMs. Any other
+/// kind gives 0: lowerToLLVM15 drops it (guarantee-only list) or refuses it.
 uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
   switch (Kind) {
   case Attribute::Alignment:
     return bitc::ATTR_KIND_ALIGNMENT;
+  case Attribute::AllocAlign:
+    return bitc::ATTR_KIND_ALLOC_ALIGN;
+  case Attribute::AllocSize:
+    return bitc::ATTR_KIND_ALLOC_SIZE;
   case Attribute::AlwaysInline:
     return bitc::ATTR_KIND_ALWAYS_INLINE;
   case Attribute::Builtin:
@@ -385,6 +419,14 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_IN_ALLOCA;
   case Attribute::Cold:
     return bitc::ATTR_KIND_COLD;
+  case Attribute::DisableSanitizerInstrumentation:
+    return bitc::ATTR_KIND_DISABLE_SANITIZER_INSTRUMENTATION;
+  case Attribute::FnRetThunkExtern:
+    return bitc::ATTR_KIND_FNRETTHUNK_EXTERN;
+  case Attribute::Hot:
+    return bitc::ATTR_KIND_HOT;
+  case Attribute::ElementType:
+    return bitc::ATTR_KIND_ELEMENTTYPE;
   case Attribute::InlineHint:
     return bitc::ATTR_KIND_INLINE_HINT;
   case Attribute::InReg:
@@ -393,6 +435,10 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_JUMP_TABLE;
   case Attribute::MinSize:
     return bitc::ATTR_KIND_MIN_SIZE;
+  case Attribute::AllocatedPointer:
+    return bitc::ATTR_KIND_ALLOCATED_POINTER;
+  case Attribute::AllocKind:
+    return bitc::ATTR_KIND_ALLOC_KIND;
   case Attribute::Naked:
     return bitc::ATTR_KIND_NAKED;
   case Attribute::Nest:
@@ -401,12 +447,20 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_NO_ALIAS;
   case Attribute::NoBuiltin:
     return bitc::ATTR_KIND_NO_BUILTIN;
+  case Attribute::NoCallback:
+    return bitc::ATTR_KIND_NO_CALLBACK;
   case Attribute::NoDuplicate:
     return bitc::ATTR_KIND_NO_DUPLICATE;
+  case Attribute::NoFree:
+    return bitc::ATTR_KIND_NOFREE;
   case Attribute::NoImplicitFloat:
     return bitc::ATTR_KIND_NO_IMPLICIT_FLOAT;
   case Attribute::NoInline:
     return bitc::ATTR_KIND_NO_INLINE;
+  case Attribute::NoRecurse:
+    return bitc::ATTR_KIND_NO_RECURSE;
+  case Attribute::NoMerge:
+    return bitc::ATTR_KIND_NO_MERGE;
   case Attribute::NonLazyBind:
     return bitc::ATTR_KIND_NON_LAZY_BIND;
   case Attribute::NonNull:
@@ -419,8 +473,22 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_NO_RED_ZONE;
   case Attribute::NoReturn:
     return bitc::ATTR_KIND_NO_RETURN;
+  case Attribute::NoSync:
+    return bitc::ATTR_KIND_NOSYNC;
+  case Attribute::NoCfCheck:
+    return bitc::ATTR_KIND_NOCF_CHECK;
+  case Attribute::NoProfile:
+    return bitc::ATTR_KIND_NO_PROFILE;
   case Attribute::NoUnwind:
     return bitc::ATTR_KIND_NO_UNWIND;
+  case Attribute::NoSanitizeBounds:
+    return bitc::ATTR_KIND_NO_SANITIZE_BOUNDS;
+  case Attribute::NoSanitizeCoverage:
+    return bitc::ATTR_KIND_NO_SANITIZE_COVERAGE;
+  case Attribute::NullPointerIsValid:
+    return bitc::ATTR_KIND_NULL_POINTER_IS_VALID;
+  case Attribute::OptForFuzzing:
+    return bitc::ATTR_KIND_OPT_FOR_FUZZING;
   case Attribute::OptimizeForSize:
     return bitc::ATTR_KIND_OPTIMIZE_FOR_SIZE;
   case Attribute::OptimizeNone:
@@ -435,6 +503,8 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_RETURNS_TWICE;
   case Attribute::SExt:
     return bitc::ATTR_KIND_S_EXT;
+  case Attribute::Speculatable:
+    return bitc::ATTR_KIND_SPECULATABLE;
   case Attribute::StackAlignment:
     return bitc::ATTR_KIND_STACK_ALIGNMENT;
   case Attribute::StackProtect:
@@ -445,31 +515,55 @@ uint64_t AIRBitcodeWriter::getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_STACK_PROTECT_STRONG;
   case Attribute::SafeStack:
     return bitc::ATTR_KIND_SAFESTACK;
+  case Attribute::ShadowCallStack:
+    return bitc::ATTR_KIND_SHADOWCALLSTACK;
+  case Attribute::StrictFP:
+    return bitc::ATTR_KIND_STRICT_FP;
   case Attribute::StructRet:
     return bitc::ATTR_KIND_STRUCT_RET;
   case Attribute::SanitizeAddress:
     return bitc::ATTR_KIND_SANITIZE_ADDRESS;
+  case Attribute::SanitizeHWAddress:
+    return bitc::ATTR_KIND_SANITIZE_HWADDRESS;
   case Attribute::SanitizeThread:
     return bitc::ATTR_KIND_SANITIZE_THREAD;
   case Attribute::SanitizeMemory:
     return bitc::ATTR_KIND_SANITIZE_MEMORY;
+  case Attribute::SpeculativeLoadHardening:
+    return bitc::ATTR_KIND_SPECULATIVE_LOAD_HARDENING;
+  case Attribute::SwiftError:
+    return bitc::ATTR_KIND_SWIFT_ERROR;
+  case Attribute::SwiftSelf:
+    return bitc::ATTR_KIND_SWIFT_SELF;
+  case Attribute::SwiftAsync:
+    return bitc::ATTR_KIND_SWIFT_ASYNC;
   case Attribute::UWTable:
     return bitc::ATTR_KIND_UW_TABLE;
+  case Attribute::VScaleRange:
+    return bitc::ATTR_KIND_VSCALE_RANGE;
+  case Attribute::WillReturn:
+    return bitc::ATTR_KIND_WILLRETURN;
+  case Attribute::WriteOnly:
+    return bitc::ATTR_KIND_WRITEONLY;
   case Attribute::ZExt:
     return bitc::ATTR_KIND_Z_EXT;
-  case Attribute::EndAttrKinds:
-    llvm_unreachable("Can not encode end-attribute kinds marker.");
-  case Attribute::None:
-    llvm_unreachable("Can not encode none-attribute.");
-  case Attribute::EmptyKey:
-  case Attribute::TombstoneKey:
-    llvm_unreachable("Trying to encode EmptyKey/TombstoneKey");
+  case Attribute::ImmArg:
+    return bitc::ATTR_KIND_IMMARG;
+  case Attribute::SanitizeMemTag:
+    return bitc::ATTR_KIND_SANITIZE_MEMTAG;
+  case Attribute::Preallocated:
+    return bitc::ATTR_KIND_PREALLOCATED;
+  case Attribute::NoUndef:
+    return bitc::ATTR_KIND_NOUNDEF;
+  case Attribute::ByRef:
+    return bitc::ATTR_KIND_BYREF;
+  case Attribute::MustProgress:
+    return bitc::ATTR_KIND_MUSTPROGRESS;
+  case Attribute::PresplitCoroutine:
+    return bitc::ATTR_KIND_PRESPLIT_COROUTINE;
   default:
-    llvm_unreachable("Trying to encode attribute not supported by DXIL. These "
-                     "should be stripped in DXILPrepare");
+    return 0;
   }
-
-  llvm_unreachable("Trying to encode unknown attribute");
 }
 
 void AIRBitcodeWriter::emitSignedInt64(SmallVectorImpl<uint64_t> &Vals,
@@ -504,8 +598,10 @@ uint64_t AIRBitcodeWriter::getOptimizationFlags(const Value *V) {
     if (PEO->isExact())
       Flags |= 1 << bitc::PEO_EXACT;
   } else if (const auto *FPMO = dyn_cast<FPMathOperator>(V)) {
-    if (FPMO->hasAllowReassoc() || FPMO->hasAllowContract())
-      Flags |= bitc::UnsafeAlgebra;
+    // LLVM 15's FastMathMap bits; lowerToLLVM15 cleared them where LLVM 15
+    // takes none.
+    if (FPMO->hasAllowReassoc())
+      Flags |= bitc::AllowReassoc;
     if (FPMO->hasNoNaNs())
       Flags |= bitc::NoNaNs;
     if (FPMO->hasNoInfs())
@@ -514,6 +610,10 @@ uint64_t AIRBitcodeWriter::getOptimizationFlags(const Value *V) {
       Flags |= bitc::NoSignedZeros;
     if (FPMO->hasAllowReciprocal())
       Flags |= bitc::AllowReciprocal;
+    if (FPMO->hasAllowContract())
+      Flags |= bitc::AllowContract;
+    if (FPMO->hasApproxFunc())
+      Flags |= bitc::ApproxFunc;
   }
 
   return Flags;
@@ -592,6 +692,61 @@ unsigned AIRBitcodeWriter::getEncodedThreadLocalMode(const GlobalValue &GV) {
   llvm_unreachable("Invalid TLS model");
 }
 
+unsigned AIRBitcodeWriter::getEncodedUnnamedAddr(const GlobalValue &GV) {
+  switch (GV.getUnnamedAddr()) {
+  case GlobalValue::UnnamedAddr::None:
+    return 0;
+  case GlobalValue::UnnamedAddr::Local:
+    return 2;
+  case GlobalValue::UnnamedAddr::Global:
+    return 1;
+  }
+  llvm_unreachable("Invalid unnamed_addr");
+}
+
+/// LLVM 15's attributes for the strongest form that covers ME (access first,
+/// then location), and the MemoryEffects LLVM 23's reader rebuilds from them
+/// (upgradeOldMemoryAttribute, L23/lib/Bitcode/Reader/BitcodeReader.cpp).
+/// ME is exact in LLVM 15 when that is ME itself; unknown means no attribute.
+static MemoryEffects memory15(MemoryEffects ME,
+                              SmallVectorImpl<uint64_t> *Codes) {
+  auto Push = [Codes](uint64_t Code) {
+    if (Codes)
+      Codes->push_back(Code);
+  };
+  if (ME.doesNotAccessMemory()) {
+    Push(bitc::ATTR_KIND_READ_NONE);
+    return MemoryEffects::none();
+  }
+  MemoryEffects R = MemoryEffects::unknown();
+  switch (ME.getModRef()) {
+  case ModRefInfo::Ref:
+    Push(bitc::ATTR_KIND_READ_ONLY);
+    R &= MemoryEffects::readOnly();
+    break;
+  case ModRefInfo::Mod:
+    Push(bitc::ATTR_KIND_WRITEONLY);
+    R &= MemoryEffects::writeOnly();
+    break;
+  default:
+    break;
+  }
+  MemoryEffects NoArg = ME.getWithoutLoc(IRMemLocation::ArgMem);
+  if (NoArg.doesNotAccessMemory()) {
+    Push(bitc::ATTR_KIND_ARGMEMONLY);
+    R &= MemoryEffects::argMemOnly();
+  } else if (ME.getWithoutLoc(IRMemLocation::InaccessibleMem)
+                 .doesNotAccessMemory()) {
+    Push(bitc::ATTR_KIND_INACCESSIBLEMEM_ONLY);
+    R &= MemoryEffects::inaccessibleMemOnly();
+  } else if (NoArg.getWithoutLoc(IRMemLocation::InaccessibleMem)
+                 .doesNotAccessMemory()) {
+    Push(bitc::ATTR_KIND_INACCESSIBLEMEM_OR_ARGMEMONLY);
+    R &= MemoryEffects::inaccessibleOrArgMemOnly();
+  }
+  return R;
+}
+
 unsigned AIRBitcodeWriter::getEncodedComdatSelectionKind(const Comdat &C) {
   switch (C.getSelectionKind()) {
   case Comdat::Any:
@@ -628,36 +783,37 @@ void AIRBitcodeWriter::writeAttributeGroupTable() {
     Record.push_back(AttrListIndex);
 
     for (Attribute Attr : AS) {
-      if (Attr.isEnumAttribute()) {
-        uint64_t Val = getAttrKindEncoding(Attr.getKindAsEnum());
-        assert(Val <= bitc::ATTR_KIND_ARGMEMONLY &&
-               "DXIL does not support attributes above ATTR_KIND_ARGMEMONLY");
-        Record.push_back(0);
-        Record.push_back(Val);
-      } else if (Attr.isIntAttribute()) {
-        if (Attr.getKindAsEnum() == Attribute::AttrKind::Memory) {
-          MemoryEffects ME = Attr.getMemoryEffects();
-          if (ME.doesNotAccessMemory()) {
+      if (!Attr.isStringAttribute()) {
+        // lowerToLLVM15 left only what LLVM 15 holds exactly; anything else
+        // here is an error, not a guess.
+        Attribute::AttrKind Kind = Attr.getKindAsEnum();
+        if (Kind == Attribute::Memory) {
+          SmallVector<uint64_t, 2> Codes;
+          if (memory15(Attr.getMemoryEffects(), &Codes) !=
+              Attr.getMemoryEffects())
+            fail("attribute " + Attr.getAsString() + ": no exact LLVM 15 form");
+          for (uint64_t Code : Codes) {
             Record.push_back(0);
-            Record.push_back(bitc::ATTR_KIND_READ_NONE);
-          } else {
-            if (ME.onlyReadsMemory()) {
-              Record.push_back(0);
-              Record.push_back(bitc::ATTR_KIND_READ_ONLY);
-            }
-            if (ME.onlyAccessesArgPointees()) {
-              Record.push_back(0);
-              Record.push_back(bitc::ATTR_KIND_ARGMEMONLY);
-            }
+            Record.push_back(Code);
           }
-        } else {
-          uint64_t Val = getAttrKindEncoding(Attr.getKindAsEnum());
-          assert(Val <= bitc::ATTR_KIND_ARGMEMONLY &&
-                 "DXIL does not support attributes above ATTR_KIND_ARGMEMONLY");
-          Record.push_back(1);
-          Record.push_back(Val);
-          Record.push_back(Attr.getValueAsInt());
+          continue;
         }
+        if (Kind == Attribute::Captures) {
+          if (Attr.getCaptureInfo() != CaptureInfo::none())
+            fail("attribute " + Attr.getAsString() + ": no LLVM 15 form");
+          Record.push_back(0);
+          Record.push_back(bitc::ATTR_KIND_NO_CAPTURE);
+          continue;
+        }
+        uint64_t Code = getAttrKindEncoding(Kind);
+        if (!Code || !(Attr.isEnumAttribute() || Attr.isIntAttribute())) {
+          fail("attribute " + Attr.getAsString() + ": no LLVM 15 encoding");
+          continue;
+        }
+        Record.push_back(Attr.isIntAttribute() ? 1 : 0);
+        Record.push_back(Code);
+        if (Attr.isIntAttribute())
+          Record.push_back(Attr.getValueAsInt());
       } else {
         StringRef Kind = Attr.getKindAsString();
         StringRef Val = Attr.getValueAsString();
@@ -770,8 +926,9 @@ void AIRBitcodeWriter::writeTypeTable() {
     case Type::X86_AMXTyID:
     case Type::TokenTyID:
     case Type::TargetExtTyID:
-      llvm_unreachable("These should never be used!!!");
-      break;
+    case Type::ByteTyID:
+      fail("type " + typeName(T) + ": no LLVM 15 AIR encoding");
+      continue;
     case Type::VoidTyID:
       Code = bitc::TYPE_CODE_VOID;
       break;
@@ -798,12 +955,6 @@ void AIRBitcodeWriter::writeTypeTable() {
       break;
     case Type::MetadataTyID:
       Code = bitc::TYPE_CODE_METADATA;
-      break;
-    case Type::ByteTyID:
-      // BYTE: [width]
-      // Note: we downgrade by converting to the equivalent integer.
-      Code = bitc::TYPE_CODE_INTEGER;
-      TypeVals.push_back(T->getByteBitWidth());
       break;
     case Type::IntegerTyID:
       // INTEGER: [width]
@@ -874,8 +1025,11 @@ void AIRBitcodeWriter::writeTypeTable() {
       AbbrevToUse = ArrayAbbrev;
       break;
     }
-    case Type::FixedVectorTyID:
-    case Type::ScalableVectorTyID: {
+    case Type::ScalableVectorTyID:
+      fail("type " + typeName(T) +
+           ": a scalable vector has no LLVM 15 AIR encoding");
+      continue;
+    case Type::FixedVectorTyID: {
       VectorType *VT = cast<VectorType>(T);
       // VECTOR [numelts, eltty]
       Code = bitc::TYPE_CODE_VECTOR;
@@ -899,7 +1053,9 @@ void AIRBitcodeWriter::writeComdats() {
     // COMDAT: [selection_kind, name]
     Vals.push_back(getEncodedComdatSelectionKind(*C));
     size_t Size = C->getName().size();
-    assert(isUInt<16>(Size));
+    if (!isUInt<16>(Size))
+      fail("comdat " + C->getName().take_front(32) +
+           "...: a name longer than 65535 bytes");
     Vals.push_back(Size);
     for (char Chr : C->getName())
       Vals.push_back((unsigned char)Chr);
@@ -1010,8 +1166,28 @@ void AIRBitcodeWriter::writeModuleInfo() {
     SimpleGVarAbbrev = Stream.EmitAbbrev(std::move(Abbv));
   }
 
-  // Emit the global variable information.
   SmallVector<unsigned, 64> Vals;
+  // Emit the module's source file name, as LLVM 15 does (P7): without it
+  // a reader takes the ModuleID, the file's path.
+  {
+    StringRef Name = M.getSourceFileName();
+    bool Char6 =
+        all_of(Name, [](char C) { return BitCodeAbbrevOp::isChar6(C); });
+    bool Fixed7 = none_of(Name, [](char C) { return (unsigned char)C & 128; });
+    auto Abbv = std::make_shared<BitCodeAbbrev>();
+    Abbv->Add(BitCodeAbbrevOp(bitc::MODULE_CODE_SOURCE_FILENAME));
+    Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+    Abbv->Add(Char6    ? BitCodeAbbrevOp(BitCodeAbbrevOp::Char6)
+              : Fixed7 ? BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 7)
+                       : BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 8));
+    unsigned FilenameAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+    for (char C : Name)
+      Vals.push_back((unsigned char)C);
+    Stream.EmitRecord(bitc::MODULE_CODE_SOURCE_FILENAME, Vals, FilenameAbbrev);
+    Vals.clear();
+  }
+
+  // Emit the global variable information.
   for (const GlobalVariable &GV : M.globals()) {
     unsigned AbbrevToUse = 0;
 
@@ -1038,7 +1214,7 @@ void AIRBitcodeWriter::writeModuleInfo() {
         GV.hasComdat()) {
       Vals.push_back(getEncodedVisibility(GV));
       Vals.push_back(getEncodedThreadLocalMode(GV));
-      Vals.push_back(GV.getUnnamedAddr() != GlobalValue::UnnamedAddr::None);
+      Vals.push_back(getEncodedUnnamedAddr(GV));
       Vals.push_back(GV.isExternallyInitialized());
       Vals.push_back(getEncodedDLLStorageClass(GV));
       Vals.push_back(GV.hasComdat() ? VE.getComdatID(GV.getComdat()) : 0);
@@ -1065,7 +1241,7 @@ void AIRBitcodeWriter::writeModuleInfo() {
                                   : 0);
     Vals.push_back(getEncodedVisibility(F));
     Vals.push_back(F.hasGC() ? GCMap[F.getGC()] : 0);
-    Vals.push_back(F.getUnnamedAddr() != GlobalValue::UnnamedAddr::None);
+    Vals.push_back(getEncodedUnnamedAddr(F));
     Vals.push_back(
         F.hasPrologueData() ? (VE.getValueID(F.getPrologueData()) + 1) : 0);
     Vals.push_back(getEncodedDLLStorageClass(F));
@@ -1089,7 +1265,7 @@ void AIRBitcodeWriter::writeModuleInfo() {
     Vals.push_back(getEncodedVisibility(A));
     Vals.push_back(getEncodedDLLStorageClass(A));
     Vals.push_back(getEncodedThreadLocalMode(A));
-    Vals.push_back(A.getUnnamedAddr() != GlobalValue::UnnamedAddr::None);
+    Vals.push_back(getEncodedUnnamedAddr(A));
     unsigned AbbrevToUse = 0;
     Stream.EmitRecord(bitc::MODULE_CODE_ALIAS_OLD, Vals, AbbrevToUse);
     Vals.clear();
@@ -1361,6 +1537,8 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
     unsigned AbbrevToUse = 0;
     if (C->isNullValue()) {
       Code = bitc::CST_CODE_NULL;
+    } else if (isa<PoisonValue>(C)) {
+      Code = bitc::CST_CODE_POISON;
     } else if (isa<UndefValue>(C)) {
       Code = bitc::CST_CODE_UNDEF;
     } else if (const ConstantInt *IV = dyn_cast<ConstantInt>(C)) {
@@ -1415,7 +1593,8 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
         Record.push_back(p[0]);
         Record.push_back(p[1]);
       } else {
-        assert(0 && "Unknown FP type!");
+        fail("constant: an FP type with no LLVM 15 encoding, " +
+             typeName(Ty));
       }
     } else if (isa<ConstantDataSequential>(C) &&
                cast<ConstantDataSequential>(C)->isString()) {
@@ -1448,28 +1627,14 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
                    dyn_cast<ConstantDataSequential>(C)) {
       Code = bitc::CST_CODE_DATA;
       Type *EltTy = CDS->getElementType();
+      // As LLVM 15 writes it: FP elements (half included) by their bits.
       if (isa<IntegerType>(EltTy) || isa<ByteType>(EltTy)) {
         for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i)
           Record.push_back(CDS->getElementAsInteger(i));
-      } else if (EltTy->isFloatTy()) {
-        for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i) {
-          union {
-            float F;
-            uint32_t I;
-          };
-          F = CDS->getElementAsFloat(i);
-          Record.push_back(I);
-        }
       } else {
-        assert(EltTy->isDoubleTy() && "Unknown ConstantData element type");
-        for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i) {
-          union {
-            double F;
-            uint64_t I;
-          };
-          F = CDS->getElementAsDouble(i);
-          Record.push_back(I);
-        }
+        for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i)
+          Record.push_back(
+              CDS->getElementAsAPFloat(i).bitcastToAPInt().getLimitedValue());
       }
     } else if (isa<ConstantArray>(C) || isa<ConstantStruct>(C) ||
                isa<ConstantVector>(C)) {
@@ -1482,13 +1647,22 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       default:
         if (Instruction::isCast(CE->getOpcode())) {
           Code = bitc::CST_CODE_CE_CAST;
+          if (getEncodedCastOpcode(CE->getOpcode()) == ~0U)
+            fail(std::string("constant ") + CE->getOpcodeName() +
+                 ": no LLVM 15 encoding");
           Record.push_back(getEncodedCastOpcode(CE->getOpcode()));
           Record.push_back(
               getTypeID(C->getOperand(0)->getType(), C->getOperand(0)));
           Record.push_back(VE.getValueID(C->getOperand(0)));
           AbbrevToUse = CONSTANTS_CE_CAST_Abbrev;
         } else {
-          assert(CE->getNumOperands() == 2 && "Unknown constant expr!");
+          if (!Instruction::isBinaryOp(CE->getOpcode()) ||
+              getEncodedBinaryOpcode(CE->getOpcode()) == ~0U) {
+            fail(std::string("constant ") + CE->getOpcodeName() +
+                 ": no LLVM 15 encoding");
+            Record.clear();
+            continue;
+          }
           Code = bitc::CST_CODE_CE_BINOP;
           Record.push_back(getEncodedBinaryOpcode(CE->getOpcode()));
           Record.push_back(VE.getValueID(C->getOperand(0)));
@@ -1554,10 +1728,13 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       Record.push_back(VE.getValueID(BA->getFunction()));
       Record.push_back(VE.getGlobalBasicBlockID(BA->getBasicBlock()));
     } else {
-#ifndef NDEBUG
-      C->dump();
-#endif
-      llvm_unreachable("Unknown constant!");
+      std::string S;
+      raw_string_ostream OS(S);
+      C->printAsOperand(OS, /*PrintType=*/true, &M);
+      fail("constant " + StringRef(S).take_front(80) +
+           ": a kind with no LLVM 15 encoding");
+      Record.clear();
+      continue;
     }
     Stream.EmitRecord(Code, Record, AbbrevToUse);
     Record.clear();
@@ -1620,16 +1797,27 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
   unsigned Code = 0;
   unsigned AbbrevToUse = 0;
   VE.setInstructionID(&I);
+  // P17: an opcode the records cannot hold is an error naming it, never a
+  // record written from the wrong layout. lowerToLLVM15 refuses these first.
+  auto Unencodable = [&] {
+    fail(Twine(I.getOpcodeName()) + ": no LLVM 15 encoding (in @" +
+         I.getFunction()->getName() + ")");
+    Vals.clear();
+  };
   switch (I.getOpcode()) {
   default:
     if (Instruction::isCast(I.getOpcode())) {
+      if (getEncodedCastOpcode(I.getOpcode()) == ~0U)
+        return Unencodable();
       Code = bitc::FUNC_CODE_INST_CAST;
       if (!pushValueAndType(I.getOperand(0), InstID, Vals))
         AbbrevToUse = (unsigned)FUNCTION_INST_CAST_ABBREV;
       Vals.push_back(getTypeID(I.getType(), &I));
       Vals.push_back(getEncodedCastOpcode(I.getOpcode()));
     } else {
-      assert(isa<BinaryOperator>(I) && "Unknown instruction!");
+      if (!isa<BinaryOperator>(I) ||
+          getEncodedBinaryOpcode(I.getOpcode()) == ~0U)
+        return Unencodable();
       Code = bitc::FUNC_CODE_INST_BINOP;
       if (!pushValueAndType(I.getOperand(0), InstID, Vals))
         AbbrevToUse = (unsigned)FUNCTION_INST_BINOP_ABBREV;
@@ -1642,6 +1830,20 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
         Vals.push_back(Flags);
       }
     }
+    break;
+
+  case Instruction::FNeg: {
+    Code = bitc::FUNC_CODE_INST_UNOP;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
+    Vals.push_back(getEncodedUnaryOpcode(I.getOpcode()));
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals.push_back(Flags);
+    break;
+  }
+  case Instruction::Freeze:
+    Code = bitc::FUNC_CODE_INST_FREEZE;
+    pushValueAndType(I.getOperand(0), InstID, Vals);
     break;
 
   case Instruction::GetElementPtr: {
@@ -1669,12 +1871,16 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Vals.append(IVI->idx_begin(), IVI->idx_end());
     break;
   }
-  case Instruction::Select:
+  case Instruction::Select: {
     Code = bitc::FUNC_CODE_INST_VSELECT;
     pushValueAndType(I.getOperand(1), InstID, Vals);
     pushValue(I.getOperand(2), InstID, Vals);
     pushValueAndType(I.getOperand(0), InstID, Vals);
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals.push_back(Flags);
     break;
+  }
   case Instruction::ExtractElement:
     Code = bitc::FUNC_CODE_INST_EXTRACTELT;
     pushValueAndType(I.getOperand(0), InstID, Vals);
@@ -1796,6 +2002,9 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
       pushValueSigned(PN.getIncomingValue(i), InstID, Vals64);
       Vals64.push_back(VE.getValueID(PN.getIncomingBlock(i)));
     }
+    uint64_t Flags = getOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals64.push_back(Flags);
     // Emit a Vals64 vector and exit.
     Stream.EmitRecord(Code, Vals64, AbbrevToUse);
     Vals64.clear();
@@ -1824,11 +2033,20 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Vals.push_back(VE.getTypeID(Types.allocatedType(AI)));
     Vals.push_back(getTypeID(I.getOperand(0)->getType()));
     Vals.push_back(VE.getValueID(I.getOperand(0))); // size.
-    unsigned AlignRecord = Log2_32(AI.getAlign().value()) + 1;
-    assert(AlignRecord < 1 << 5 && "alignment greater than 1 << 64");
-    AlignRecord |= AI.isUsedWithInAlloca() << 5;
-    AlignRecord |= 1 << 6;
-    Vals.push_back(AlignRecord);
+    // As LLVM 15 packs it: alignments past 2^30 too, and swifterror.
+    using APV = AllocaPackedValues;
+    unsigned Record = 0;
+    unsigned EncodedAlign = getEncodedAlign(AI.getAlign());
+    Bitfield::set<APV::AlignLower>(
+        Record, EncodedAlign & ((1 << APV::AlignLower::Bits) - 1));
+    Bitfield::set<APV::AlignUpper>(Record,
+                                   EncodedAlign >> APV::AlignLower::Bits);
+    Bitfield::set<APV::UsedWithInAlloca>(Record, AI.isUsedWithInAlloca());
+    Bitfield::set<APV::ExplicitType>(Record, true);
+    Bitfield::set<APV::SwiftError>(Record, AI.isSwiftError());
+    Vals.push_back(Record);
+    if (AI.getAddressSpace() != M.getDataLayout().getAllocaAddrSpace())
+      Vals.push_back(AI.getAddressSpace());
     break;
   }
 
@@ -1878,17 +2096,23 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Vals.push_back(
         getEncodedOrdering(cast<AtomicCmpXchgInst>(I).getFailureOrdering()));
     Vals.push_back(cast<AtomicCmpXchgInst>(I).isWeak());
+    Vals.push_back(getEncodedAlign(cast<AtomicCmpXchgInst>(I).getAlign()));
     break;
   case Instruction::AtomicRMW:
+    // Code 59 with its value's type, as LLVM 15 writes it: without the type
+    // a forward-referenced value cannot be read.
+    if (getEncodedRMWOperation(cast<AtomicRMWInst>(I).getOperation()) == ~0U)
+      return Unencodable();
     Code = bitc::FUNC_CODE_INST_ATOMICRMW;
     pushValueAndType(I.getOperand(0), InstID, Vals); // ptrty + ptr
-    pushValue(I.getOperand(1), InstID, Vals);        // val.
+    pushValueAndType(I.getOperand(1), InstID, Vals); // valty + val
     Vals.push_back(
         getEncodedRMWOperation(cast<AtomicRMWInst>(I).getOperation()));
     Vals.push_back(cast<AtomicRMWInst>(I).isVolatile());
     Vals.push_back(getEncodedOrdering(cast<AtomicRMWInst>(I).getOrdering()));
     Vals.push_back(
         getEncodedSyncScopeID(cast<AtomicRMWInst>(I).getSyncScopeID()));
+    Vals.push_back(getEncodedAlign(cast<AtomicRMWInst>(I).getAlign()));
     break;
   case Instruction::Fence:
     Code = bitc::FUNC_CODE_INST_FENCE;
@@ -1902,8 +2126,16 @@ void AIRBitcodeWriter::writeInstruction(const Instruction &I, unsigned InstID,
     Code = bitc::FUNC_CODE_INST_CALL;
 
     Vals.push_back(VE.getAttributeListID(CI.getAttributes()));
-    Vals.push_back((CI.getCallingConv() << 1) | unsigned(CI.isTailCall()) |
-                   unsigned(CI.isMustTailCall()) << 14 | 1 << 15);
+    // LLVM 15's markers: notail and the fast-math flags (before the type).
+    unsigned Flags = getOptimizationFlags(&I);
+    Vals.push_back(CI.getCallingConv() << bitc::CALL_CCONV |
+                   unsigned(CI.isTailCall()) << bitc::CALL_TAIL |
+                   unsigned(CI.isMustTailCall()) << bitc::CALL_MUSTTAIL |
+                   1 << bitc::CALL_EXPLICIT_TYPE |
+                   unsigned(CI.isNoTailCall()) << bitc::CALL_NOTAIL |
+                   unsigned(Flags != 0) << bitc::CALL_FMF);
+    if (Flags != 0)
+      Vals.push_back(Flags);
     Vals.push_back(VE.getTypeID(Types.callType(CI)));
     pushValueAndType(CI.getCalledOperand(), InstID, Vals); // Callee
 
@@ -2171,7 +2403,7 @@ void AIRBitcodeWriter::writeBlockInfo() {
     Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // LHS
     Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // RHS
     Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 4)); // opc
-    Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 7)); // flags
+    Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 8)); // flags (15's)
     if (Stream.EmitBlockInfoAbbrev(bitc::FUNCTION_BLOCK_ID, std::move(Abbv)) !=
         (unsigned)FUNCTION_INST_BINOP_FLAGS_ABBREV)
       assert(false && "Unexpected abbrev ordering!");
@@ -2231,13 +2463,67 @@ void AIRBitcodeWriter::writeModuleVersion() {
   Stream.EmitRecord(bitc::MODULE_CODE_VERSION, ArrayRef<unsigned>{1});
 }
 
+/// The identification block as LLVM 15 writes it, naming LLVM 15 as the
+/// producer: the records are LLVM 15's (P7).
+void AIRBitcodeWriter::writeIdentificationBlock(BitstreamWriter &Stream) {
+  Stream.EnterSubblock(bitc::IDENTIFICATION_BLOCK_ID, 5);
+
+  auto Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::IDENTIFICATION_CODE_STRING));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Char6));
+  auto StringAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+  writeStringRecord(Stream, bitc::IDENTIFICATION_CODE_STRING, "LLVM15.0.7",
+                    StringAbbrev);
+
+  Abbv = std::make_shared<BitCodeAbbrev>();
+  Abbv->Add(BitCodeAbbrevOp(bitc::IDENTIFICATION_CODE_EPOCH));
+  Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));
+  auto EpochAbbrev = Stream.EmitAbbrev(std::move(Abbv));
+  constexpr std::array<unsigned, 1> Vals = {{0}};
+  Stream.EmitRecord(bitc::IDENTIFICATION_CODE_EPOCH, Vals, EpochAbbrev);
+  Stream.ExitBlock();
+}
+
+/// LLVM 15's sync scope names block: the context's names, in id order.
+void AIRBitcodeWriter::writeSyncScopeNames() {
+  SmallVector<StringRef, 8> SSNs;
+  M.getContext().getSyncScopeNames(SSNs);
+  if (SSNs.empty())
+    return;
+
+  Stream.EnterSubblock(bitc::SYNC_SCOPE_NAMES_BLOCK_ID, 2);
+  SmallVector<uint64_t, 64> Record;
+  for (StringRef SSN : SSNs) {
+    Record.append(SSN.begin(), SSN.end());
+    Stream.EmitRecord(bitc::SYNC_SCOPE_NAME, Record, 0);
+    Record.clear();
+  }
+  Stream.ExitBlock();
+}
+
+/// MODULE_CODE_HASH as LLVM 15 writes it: SHA-1 of the module block so far
+/// (no string table here, so nothing else is hashed).
+void AIRBitcodeWriter::writeModuleHash(StringRef View) {
+  SHA1 Hasher;
+  Hasher.update(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(View.data()), View.size()));
+  std::array<uint8_t, 20> Hash = Hasher.result();
+  uint32_t Vals[5];
+  for (int Pos = 0; Pos < 20; Pos += 4)
+    Vals[Pos / 4] = support::endian::read32be(Hash.data() + Pos);
+  Stream.EmitRecord(bitc::MODULE_CODE_HASH, Vals);
+}
+
 /// WriteModule - Emit the specified module to the bitstream.
 void AIRBitcodeWriter::write() {
-  // The identification block is new since llvm-3.7, but the old bitcode reader
-  // will skip it.
-  // writeIdentificationBlock(Stream);
+  if (LateType)
+    (void)VE.getTypeID(LateType);
+
+  writeIdentificationBlock(Stream);
 
   Stream.EnterSubblock(bitc::MODULE_BLOCK_ID, 3);
+  Stream.markAndBlockFlushing();
 
   // It is redundant to fully-specify this here, but nice to make it explicit
   // so that it is clear the DXIL module version is different.
@@ -2270,6 +2556,8 @@ void AIRBitcodeWriter::write() {
   // Emit metadata.
   writeModuleMetadata();
 
+  writeSyncScopeNames();
+
   // Emit names for globals/functions etc.
   // DXIL uses the same format for module-level value symbol table as for the
   // function level table.
@@ -2279,6 +2567,8 @@ void AIRBitcodeWriter::write() {
   for (const Function &F : M)
     if (!F.isDeclaration())
       writeFunction(F);
+
+  writeModuleHash(Stream.getMarkedBufferAndResumeFlushing());
 
   Stream.ExitBlock();
 }
@@ -2338,9 +2628,368 @@ static Error checkNoDebugInfo(const Module &M) {
   return Error::success();
 }
 
+static Error error(const Twine &Msg) {
+  return createStringError(inconvertibleErrorCode(), Msg);
+}
+
+/// LLVM 23-only attribute kinds that only state a guarantee, so that
+/// dropping one loses a fact and never changes behaviour (P8; each reason is
+/// in test/Bitcode/AIRWriter/attrs-23-only.ll).
+static constexpr Attribute::AttrKind GuaranteeOnly[] = {
+    Attribute::DeadOnReturn, Attribute::DeadOnUnwind,
+    Attribute::Initializes,  Attribute::NoCreateUndefOrPoison,
+    Attribute::NoFPClass,    Attribute::Range,
+    Attribute::Writable};
+
+/// AS with what LLVM 15 cannot hold dropped (guarantee-only kinds, captures
+/// other than none) or weakened (memory(...) to its strongest LLVM 15
+/// cover), each counted once; any other kind is an error.
+static Expected<AttributeSet> lowerAttributes(LLVMContext &C, AttributeSet AS,
+                                              StringRef Fn,
+                                              AIRWriteReport &R) {
+  AttrBuilder B(C);
+  bool Changed = false;
+  for (Attribute A : AS) {
+    if (A.isStringAttribute()) {
+      B.addAttribute(A);
+      continue;
+    }
+    if (A.isTypeAttribute())
+      return error(Twine("attribute ") + A.getAsString() +
+                   ": a type attribute is not written (in @" + Fn + ")");
+    Attribute::AttrKind K = A.getKindAsEnum();
+    if (K == Attribute::Memory) {
+      MemoryEffects ME = A.getMemoryEffects();
+      MemoryEffects Cover = memory15(ME, nullptr);
+      bool None = Cover == MemoryEffects::unknown();
+      if (Cover != ME) {
+        Changed = true;
+        ++R.Stats.AttrsDropped;
+        R.Explain.push_back(
+            "weaker " + A.getAsString() + " -> " +
+            (None ? std::string("no attribute")
+                  : Attribute::getWithMemoryEffects(C, Cover).getAsString()) +
+            " (in @" + Fn.str() + ")");
+      }
+      if (!None)
+        B.addMemoryAttr(Cover);
+      continue;
+    }
+    if (K == Attribute::Captures ? A.getCaptureInfo() == CaptureInfo::none()
+                                 : AIRBitcodeWriter::getAttrKindEncoding(K)) {
+      B.addAttribute(A);
+      continue;
+    }
+    if (K != Attribute::Captures && !is_contained(GuaranteeOnly, K))
+      return error(Twine("attribute ") + A.getAsString() +
+                   ": no LLVM 15 encoding, and not on the guarantee-only "
+                   "drop list (in @" +
+                   Fn + ")");
+    Changed = true;
+    ++R.Stats.AttrsDropped;
+    R.Explain.push_back("drop attribute " + A.getAsString() + " (in @" +
+                        Fn.str() + ")");
+  }
+  return Changed ? AttributeSet::get(C, B) : AS;
+}
+
+/// LLVM 15's FPMathOperator::classof: no casts, and calls, phis and selects
+/// only of FP, FP vectors and arrays of them.
+static bool takesFMF15(const Instruction &I) {
+  switch (I.getOpcode()) {
+  case Instruction::PHI:
+  case Instruction::Select:
+  case Instruction::Call: {
+    Type *T = I.getType();
+    while (auto *A = dyn_cast<ArrayType>(T))
+      T = A->getElementType();
+    return T->isFPOrFPVectorTy();
+  }
+  default:
+    return !isa<CastInst>(I);
+  }
+}
+
+/// C with LLVM 23-only GEP flags dropped (nusw without inbounds, nuw,
+/// inrange) through its operands, and the tokens one printed use loses.
+static std::pair<Constant *, unsigned>
+stripConstant(Constant *C,
+              DenseMap<Constant *, std::pair<Constant *, unsigned>> &Memo) {
+  if (!isa<ConstantExpr>(C) && !isa<ConstantAggregate>(C))
+    return {C, 0};
+  if (auto It = Memo.find(C); It != Memo.end())
+    return It->second;
+  SmallVector<Constant *, 8> Ops;
+  unsigned Tokens = 0;
+  bool Changed = false;
+  for (Value *Op : C->operands()) {
+    auto [New, T] = stripConstant(cast<Constant>(Op), Memo);
+    Ops.push_back(New);
+    Tokens += T;
+    Changed |= New != Op;
+  }
+  Constant *R = C;
+  if (auto *G = dyn_cast<GEPOperator>(C)) {
+    GEPNoWrapFlags NW = G->getNoWrapFlags();
+    unsigned Own = (!NW.isInBounds() && NW.hasNoUnsignedSignedWrap()) +
+                   NW.hasNoUnsignedWrap() + G->getInRange().has_value();
+    if (Own || Changed) {
+      SmallVector<Value *, 8> Idx(drop_begin(Ops));
+      R = ConstantExpr::getGetElementPtr(
+          G->getSourceElementType(), Ops[0], Idx,
+          NW.isInBounds() ? GEPNoWrapFlags::inBounds()
+                          : GEPNoWrapFlags::none());
+    }
+    Tokens += Own;
+  } else if (Changed) {
+    if (auto *CE = dyn_cast<ConstantExpr>(C))
+      R = CE->getWithOperands(Ops);
+    else if (auto *CA = dyn_cast<ConstantArray>(C))
+      R = ConstantArray::get(CA->getType(), Ops);
+    else if (auto *CS = dyn_cast<ConstantStruct>(C))
+      R = ConstantStruct::get(CS->getType(), Ops);
+    else
+      R = ConstantVector::get(Ops);
+  }
+  return Memo[C] = {R, Tokens};
+}
+
+/// Whether a reader replaces F's attributes with its own intrinsic table's:
+/// LLVM 23's and LLVM 15's UpgradeIntrinsicFunction both do
+/// (L23/lib/IR/AutoUpgrade.cpp:2001-2010,
+/// L15/lib/IR/AutoUpgrade.cpp:1068-1072).
+static bool readerDefinesAttributes(Function &F) {
+  SmallVector<Type *, 4> Overloads;
+  return F.getIntrinsicID() != Intrinsic::not_intrinsic &&
+         Intrinsic::isSignatureValid(F.getIntrinsicID(), F.getFunctionType(),
+                                     Overloads);
+}
+
+/// Makes M say only what LLVM 15's records can (P8): attributes and flags
+/// LLVM 23 added are dropped or weakened in the module itself and counted,
+/// so the module left behind is the module written; constructs LLVM 15
+/// cannot hold at all are errors. An intrinsic declaration is written with
+/// its lowered attributes too, but its own come back after the write
+/// (ReaderDefined): every reader resets them from its table, so those are
+/// what the written module reads as.
+static Error
+lowerToLLVM15(Module &M, AIRWriteReport &R,
+              SmallVectorImpl<std::pair<Function *, AttributeList>>
+                  &ReaderDefined) {
+  LLVMContext &C = M.getContext();
+  // Per attribute group (index, set), as the bitcode keys them: each
+  // dropped entry is counted once however many lists share the group.
+  DenseMap<std::pair<unsigned, AttributeSet>, AttributeSet> Lowered;
+  auto LowerList = [&](AttributeList AL,
+                       StringRef Fn) -> Expected<AttributeList> {
+    AttributeList Out = AL;
+    for (unsigned Idx : AL.indexes()) {
+      AttributeSet AS = AL.getAttributes(Idx);
+      if (!AS.hasAttributes())
+        continue;
+      auto It = Lowered.find({Idx, AS});
+      if (It == Lowered.end()) {
+        Expected<AttributeSet> L = lowerAttributes(C, AS, Fn, R);
+        if (!L)
+          return L.takeError();
+        It = Lowered.try_emplace({Idx, AS}, *L).first;
+      }
+      if (It->second != AS)
+        Out = Out.setAttributesAtIndex(C, Idx, It->second);
+    }
+    return Out;
+  };
+
+  for (GlobalVariable &G : M.globals())
+    if (G.hasAttributes())
+      return error("global @" + G.getName() + ": attributes are not written");
+
+  DenseMap<Constant *, std::pair<Constant *, unsigned>> Stripped;
+  for (GlobalVariable &G : M.globals())
+    if (G.hasInitializer()) {
+      auto [New, Tokens] = stripConstant(G.getInitializer(), Stripped);
+      if (Tokens) {
+        R.Stats.FlagsDropped += Tokens;
+        R.Explain.push_back("drop " + std::to_string(Tokens) +
+                            " constant getelementptr flag(s) in @" +
+                            G.getName().str());
+      }
+      if (New != G.getInitializer())
+        G.setInitializer(New);
+    }
+
+  for (Function &F : M) {
+    Expected<AttributeList> FL = LowerList(F.getAttributes(), F.getName());
+    if (!FL)
+      return FL.takeError();
+    if (*FL != F.getAttributes() && readerDefinesAttributes(F))
+      ReaderDefined.push_back({&F, F.getAttributes()});
+    F.setAttributes(*FL);
+
+    for (Instruction &I : instructions(F)) {
+      auto Name = [&] {
+        return I.hasName() ? ("%" + I.getName()).str()
+                           : std::string("a ") + I.getOpcodeName();
+      };
+      auto Fail = [&](const Twine &Why) {
+        std::string What = I.getOpcodeName();
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          What += " " +
+                  AtomicRMWInst::getOperationName(RMW->getOperation()).str();
+        if (I.hasName())
+          What += " %" + I.getName().str();
+        return error(What + ": " + Why + " (in @" + F.getName() + ")");
+      };
+      switch (I.getOpcode()) {
+      case Instruction::CallBr:
+      case Instruction::CatchPad:
+      case Instruction::CatchRet:
+      case Instruction::CatchSwitch:
+      case Instruction::CleanupPad:
+      case Instruction::CleanupRet:
+      case Instruction::PtrToAddr:
+        return Fail("no LLVM 15 encoding");
+      default:
+        break;
+      }
+      if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+          RMW && AIRBitcodeWriter::getEncodedRMWOperation(
+                     RMW->getOperation()) == ~0U)
+        return Fail("no LLVM 15 encoding");
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        if (CB->hasOperandBundles())
+          return Fail("operand bundles are not written");
+        Expected<AttributeList> CL =
+            LowerList(CB->getAttributes(), F.getName());
+        if (!CL)
+          return CL.takeError();
+        CB->setAttributes(*CL);
+      }
+
+      // LLVM 23-only flags, one token each as llvm-dis prints them.
+      SmallVector<StringRef, 4> Drop;
+      if (isa<PossiblyNonNegInst>(I) && I.hasNonNeg()) {
+        I.setNonNeg(false);
+        Drop.push_back("nneg");
+      }
+      if (auto *T = dyn_cast<TruncInst>(&I)) {
+        if (T->hasNoUnsignedWrap())
+          Drop.push_back("nuw");
+        if (T->hasNoSignedWrap())
+          Drop.push_back("nsw");
+        T->setHasNoUnsignedWrap(false);
+        T->setHasNoSignedWrap(false);
+      }
+      if (auto *D = dyn_cast<PossiblyDisjointInst>(&I); D && D->isDisjoint()) {
+        D->setIsDisjoint(false);
+        Drop.push_back("disjoint");
+      }
+      if (auto *IC = dyn_cast<ICmpInst>(&I); IC && IC->hasSameSign()) {
+        IC->setSameSign(false);
+        Drop.push_back("samesign");
+      }
+      if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+        GEPNoWrapFlags NW = G->getNoWrapFlags();
+        if (!NW.isInBounds() && NW.hasNoUnsignedSignedWrap())
+          Drop.push_back("nusw");
+        if (NW.hasNoUnsignedWrap())
+          Drop.push_back("nuw");
+        G->setNoWrapFlags(NW.isInBounds() ? GEPNoWrapFlags::inBounds()
+                                          : GEPNoWrapFlags::none());
+      }
+      if (isa<FPMathOperator>(I) && !takesFMF15(I)) {
+        FastMathFlags FMF = I.getFastMathFlags();
+        if (FMF.isFast()) {
+          Drop.push_back("fast");
+        } else {
+          if (FMF.allowReassoc())
+            Drop.push_back("reassoc");
+          if (FMF.noNaNs())
+            Drop.push_back("nnan");
+          if (FMF.noInfs())
+            Drop.push_back("ninf");
+          if (FMF.noSignedZeros())
+            Drop.push_back("nsz");
+          if (FMF.allowReciprocal())
+            Drop.push_back("arcp");
+          if (FMF.allowContract())
+            Drop.push_back("contract");
+          if (FMF.approxFunc())
+            Drop.push_back("afn");
+        }
+        I.copyFastMathFlags(FastMathFlags());
+      }
+      if (!Drop.empty()) {
+        R.Stats.FlagsDropped += Drop.size();
+        R.Explain.push_back("drop " + join(Drop, " ") + " on " + Name() +
+                            " (in @" + F.getName().str() + ")");
+      }
+
+      for (Use &U : I.operands()) {
+        auto *Op = dyn_cast<Constant>(U.get());
+        if (!Op)
+          continue;
+        auto [New, Tokens] = stripConstant(Op, Stripped);
+        if (Tokens) {
+          R.Stats.FlagsDropped += Tokens;
+          R.Explain.push_back("drop " + std::to_string(Tokens) +
+                              " constant getelementptr flag(s) on " + Name() +
+                              " (in @" + F.getName().str() + ")");
+        }
+        if (New != Op)
+          U.set(New);
+      }
+    }
+  }
+  return Error::success();
+}
+
+/// The Darwin wrapper and trailer, as LLVM 15 writes them
+/// (emitDarwinBCHeaderAndTrailer); air64 has no Mach-O CPU type, so ~0.
+static void emitDarwinBCHeaderAndTrailer(SmallVectorImpl<char> &Buffer,
+                                         const Triple &TT) {
+  enum {
+    DARWIN_CPU_ARCH_ABI64 = 0x01000000,
+    DARWIN_CPU_TYPE_X86 = 7,
+    DARWIN_CPU_TYPE_ARM = 12,
+    DARWIN_CPU_TYPE_POWERPC = 18
+  };
+  unsigned CPUType = ~0U;
+  Triple::ArchType Arch = TT.getArch();
+  if (Arch == Triple::x86_64)
+    CPUType = DARWIN_CPU_TYPE_X86 | DARWIN_CPU_ARCH_ABI64;
+  else if (Arch == Triple::x86)
+    CPUType = DARWIN_CPU_TYPE_X86;
+  else if (Arch == Triple::ppc)
+    CPUType = DARWIN_CPU_TYPE_POWERPC;
+  else if (Arch == Triple::ppc64)
+    CPUType = DARWIN_CPU_TYPE_POWERPC | DARWIN_CPU_ARCH_ABI64;
+  else if (Arch == Triple::arm || Arch == Triple::thumb)
+    CPUType = DARWIN_CPU_TYPE_ARM;
+
+  uint32_t Header[] = {0x0B17C0DE, 0, BWH_HeaderSize,
+                       uint32_t(Buffer.size() - BWH_HeaderSize), CPUType};
+  for (unsigned I = 0; I != 5; ++I)
+    support::endian::write32le(&Buffer[I * 4], Header[I]);
+
+  // If the file is not a multiple of 16 bytes, insert dummy padding.
+  while (Buffer.size() & 15)
+    Buffer.push_back(0);
+}
+
 Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
                                  raw_ostream &OS, AIRWriteReport *R) {
+  AIRWriteReport Local;
+  if (!R)
+    R = &Local;
   if (Error E = checkNoDebugInfo(M))
+    return E;
+  SmallVector<std::pair<Function *, AttributeList>, 4> ReaderDefined;
+  scope_exit Restore([&] {
+    for (auto [F, AL] : ReaderDefined)
+      F->setAttributes(AL);
+  });
+  if (Error E = lowerToLLVM15(M, *R, ReaderDefined))
     return E;
   Expected<AIRModuleTypes> Types = AIRModuleTypes::run(M, T);
   if (!Types)
@@ -2348,6 +2997,11 @@ Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
 
   SmallVector<char, 0> Buffer;
   Buffer.reserve(256 * 1024);
+  // A Darwin triple gets LLVM 15's wrapper; reserve its header.
+  const Triple &TT = M.getTargetTriple();
+  bool Darwin = TT.isOSDarwin() || TT.isOSBinFormatMachO();
+  if (Darwin)
+    Buffer.insert(Buffer.begin(), BWH_HeaderSize, 0);
   {
     BitstreamWriter Stream(Buffer);
     // Emit the file header.
@@ -2358,13 +3012,14 @@ Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
     Stream.Emit(0xE, 4);
     Stream.Emit(0xD, 4);
 
-    AIRBitcodeWriter Writer(M, *Types, Stream);
+    AIRBitcodeWriter Writer(M, *Types, Stream, R->SelfTestLateType);
     Writer.write();
     if (!Writer.error().empty())
-      return createStringError(inconvertibleErrorCode(), Writer.error());
+      return error(Writer.error());
   }
-  if (R)
-    R->Stats.RefsFilled = T.refsFilled();
+  if (Darwin)
+    emitDarwinBCHeaderAndTrailer(Buffer, TT);
+  R->Stats.RefsFilled = T.refsFilled();
   OS.write(Buffer.data(), Buffer.size());
   return Error::success();
 }

@@ -91,6 +91,11 @@ static cl::opt<bool> SelfTestBroken(
     "self-test-broken-module",
     cl::desc("Write a module the verifier rejects, built through the C API"),
     cl::cat(Cat));
+static cl::opt<bool> SelfTestLateType(
+    "self-test-late-type",
+    cl::desc("Write a module while the writer asks for a typed type that was "
+             "never enumerated"),
+    cl::cat(Cat));
 
 namespace {
 
@@ -531,6 +536,37 @@ int selfTestBrokenModule() {
   return Ret;
 }
 
+/// A valid module, written through the C++ entry with a typed type the
+/// enumerator never saw: the writer's lookup must be an error (P17).
+int selfTestLateType() {
+  LLVMContextRef C = LLVMContextCreate();
+  LLVMModuleRef M = LLVMModuleCreateWithNameInContext("late", C);
+  LLVMSetTarget(M, "air64-apple-macosx14.0.0");
+  LLVMTypeRef FT = LLVMFunctionType(LLVMVoidTypeInContext(C), nullptr, 0, 0);
+  LLVMValueRef F = LLVMAddFunction(M, "f", FT);
+  LLVMBuilderRef B = LLVMCreateBuilderInContext(C);
+  LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(C, F, "entry"));
+  LLVMBuildRetVoid(B);
+  LLVMDisposeBuilder(B);
+  air::AIRWriteReport R;
+  R.SelfTestLateType =
+      TypedPointerType::get(Type::getInt8Ty(*unwrap(C)), /*AddressSpace=*/7);
+  LLVMAIRTypes Types = {};
+  LLVMMemoryBufferRef Out = nullptr;
+  char *Msg = nullptr;
+  int Ret = 0;
+  if (air::writeAIRBitcodeC(M, &Types, &Out, nullptr, &Msg, &R)) {
+    errs() << "error: " << StringRef(Msg).rtrim() << "\n";
+    LLVMDisposeMessage(Msg);
+    Ret = 1;
+  } else {
+    LLVMDisposeMemoryBuffer(Out);
+  }
+  LLVMDisposeModule(M);
+  LLVMContextDispose(C);
+  return Ret;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -541,6 +577,8 @@ int main(int argc, char **argv) {
 
   if (SelfTestBroken)
     return selfTestBrokenModule();
+  if (SelfTestLateType)
+    return selfTestLateType();
 
   if (BatchPath.empty()) {
     if (Input.empty() || Output.empty()) {

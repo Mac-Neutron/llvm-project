@@ -23,6 +23,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBufferRef.h"
+#include <string>
 #include <utility>
 
 namespace llvm {
@@ -50,6 +51,9 @@ struct AIRTypeInput {
 
 /// T with every typed pointer replaced by `ptr` in its address space.
 Type *eraseTypedType(Type *T);
+
+/// T as LLVM prints it, for error text.
+std::string typeName(const Type *T);
 
 /// Whether T holds an opaque pointer outside identified structs.
 bool hasOpaquePointer(Type *T);

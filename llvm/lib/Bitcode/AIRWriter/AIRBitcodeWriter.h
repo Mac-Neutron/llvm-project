@@ -27,6 +27,7 @@
 namespace llvm {
 
 class Module;
+class Type;
 class raw_ostream;
 
 namespace air {
@@ -38,6 +39,9 @@ class AIRTypeTable;
 struct AIRWriteReport {
   LLVMAIRWriteStats Stats = {};
   std::vector<std::string> Explain;
+  /// Test only (llvm-air-write --self-test-late-type): a typed type the
+  /// writer asks the enumerator for and that was never enumerated.
+  Type *SelfTestLateType = nullptr;
 };
 
 /// Writes M as typed-pointer AIR bitcode to OS. M must be verified. It may be

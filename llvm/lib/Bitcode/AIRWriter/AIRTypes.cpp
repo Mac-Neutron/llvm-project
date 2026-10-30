@@ -31,12 +31,14 @@ static Error error(const Twine &Msg) {
   return createStringError(inconvertibleErrorCode(), Msg);
 }
 
-static std::string str(const Type *T) {
+std::string llvm::air::typeName(const Type *T) {
   std::string S;
   raw_string_ostream OS(S);
   T->print(OS);
   return S;
 }
+
+static std::string str(const Type *T) { return typeName(T); }
 
 static std::string str(const Value *V, const Module *M) {
   std::string S;

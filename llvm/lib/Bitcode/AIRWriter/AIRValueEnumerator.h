@@ -7,7 +7,8 @@
 // Modified by Mac-Neutron (2026): copied from
 // lib/Target/DirectX/DXILWriter/DXILValueEnumerator.h at llvmorg-23.1.4 for the
 // AIR writer; namespace llvm::air; no DXIL debug info map; types are numbered
-// in their typed form (AIRModuleTypes) only.
+// in their typed form (AIRModuleTypes) only; a lookup that misses records an
+// error (error()) and returns 0 instead of dereferencing end().
 //
 //===----------------------------------------------------------------------===//
 //
@@ -25,6 +26,7 @@
 #include "llvm/IR/Attributes.h"
 #include <cassert>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -41,6 +43,7 @@ class Metadata;
 class Module;
 class NamedMDNode;
 class raw_ostream;
+class Twine;
 class Type;
 class Value;
 class ValueSymbolTable;
@@ -145,6 +148,10 @@ private:
   /// The typed type of every value; the only source of enumerated types.
   const AIRModuleTypes &Typed;
 
+  /// The first lookup that missed (P17: never dereference end()).
+  mutable std::string Err;
+  void miss(const Twine &What) const;
+
 public:
   ValueEnumerator(const Module &M, const AIRModuleTypes &Typed);
   ValueEnumerator(const ValueEnumerator &) = delete;
@@ -157,11 +164,7 @@ public:
 
   unsigned getValueID(const Value *V) const;
 
-  unsigned getMetadataID(const Metadata *MD) const {
-    auto ID = getMetadataOrNullID(MD);
-    assert(ID != 0 && "Metadata not in slotcalculator!");
-    return ID - 1;
-  }
+  unsigned getMetadataID(const Metadata *MD) const;
 
   unsigned getMetadataOrNullID(const Metadata *MD) const {
     return MetadataMap.lookup(MD).ID;
@@ -169,30 +172,16 @@ public:
 
   unsigned numMDs() const { return MDs.size(); }
 
-  unsigned getTypeID(Type *T) const {
-    TypeMapType::const_iterator I = TypeMap.find(T);
-    assert(I != TypeMap.end() && "Type not in ValueEnumerator!");
-    return I->second - 1;
-  }
+  unsigned getTypeID(Type *T) const;
 
   unsigned getInstructionID(const Instruction *I) const;
   void setInstructionID(const Instruction *I);
 
-  unsigned getAttributeListID(AttributeList PAL) const {
-    if (PAL.isEmpty())
-      return 0; // Null maps to zero.
-    AttributeListMapType::const_iterator I = AttributeListMap.find(PAL);
-    assert(I != AttributeListMap.end() && "Attribute not in ValueEnumerator!");
-    return I->second;
-  }
+  unsigned getAttributeListID(AttributeList PAL) const;
+  unsigned getAttributeGroupID(IndexAndAttrSet Group) const;
 
-  unsigned getAttributeGroupID(IndexAndAttrSet Group) const {
-    if (!Group.second.hasAttributes())
-      return 0; // Null maps to zero.
-    AttributeGroupMapType::const_iterator I = AttributeGroupMap.find(Group);
-    assert(I != AttributeGroupMap.end() && "Attribute not in ValueEnumerator!");
-    return I->second;
-  }
+  /// The first lookup that missed, or empty.
+  const std::string &error() const { return Err; }
 
   /// getFunctionConstantRange - Return the range of values that corresponds to
   /// function-local constants.

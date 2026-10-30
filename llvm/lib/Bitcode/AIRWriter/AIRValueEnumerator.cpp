@@ -8,7 +8,8 @@
 // lib/Target/DirectX/DXILWriter/DXILValueEnumerator.cpp at llvmorg-23.1.4 for
 // the AIR writer; namespace llvm::air; no DXIL debug info map and no use-list
 // order prediction (the writer writes no use lists); every type is enumerated
-// in its typed form, from AIRModuleTypes, in module and instruction order.
+// in its typed form, from AIRModuleTypes, in module and instruction order; a
+// lookup that misses is an error, not a dereference of end() (P17).
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,6 +21,7 @@
 #include "AIRValueEnumerator.h"
 #include "AIRTypes.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
@@ -208,13 +210,65 @@ void ValueEnumerator::setInstructionID(const Instruction *I) {
   InstructionMap[I] = InstructionCount++;
 }
 
+void ValueEnumerator::miss(const Twine &What) const {
+  if (Err.empty())
+    Err = What.str();
+}
+
 unsigned ValueEnumerator::getValueID(const Value *V) const {
   if (auto *MD = dyn_cast<MetadataAsValue>(V))
     return getMetadataID(MD->getMetadata());
 
   ValueMapType::const_iterator I = ValueMap.find(V);
-  assert(I != ValueMap.end() && "Value not in slotcalculator!");
+  if (I == ValueMap.end()) {
+    std::string S;
+    raw_string_ostream OS(S);
+    V->printAsOperand(OS, /*PrintType=*/true);
+    miss("value " + S + " was not enumerated");
+    return 0;
+  }
   return I->second - 1;
+}
+
+unsigned ValueEnumerator::getMetadataID(const Metadata *MD) const {
+  unsigned ID = getMetadataOrNullID(MD);
+  if (!ID) {
+    miss("metadata: a node that was not enumerated");
+    return 0;
+  }
+  return ID - 1;
+}
+
+unsigned ValueEnumerator::getTypeID(Type *T) const {
+  TypeMapType::const_iterator I = TypeMap.find(T);
+  // ~0U marks an identified struct still being enumerated.
+  if (I == TypeMap.end() || I->second == ~0U) {
+    miss("type table: " + typeName(T) + " was not enumerated");
+    return 0;
+  }
+  return I->second - 1;
+}
+
+unsigned ValueEnumerator::getAttributeListID(AttributeList PAL) const {
+  if (PAL.isEmpty())
+    return 0; // Null maps to zero.
+  AttributeListMapType::const_iterator I = AttributeListMap.find(PAL);
+  if (I == AttributeListMap.end()) {
+    miss("attributes: a list that was not enumerated");
+    return 0;
+  }
+  return I->second;
+}
+
+unsigned ValueEnumerator::getAttributeGroupID(IndexAndAttrSet Group) const {
+  if (!Group.second.hasAttributes())
+    return 0; // Null maps to zero.
+  AttributeGroupMapType::const_iterator I = AttributeGroupMap.find(Group);
+  if (I == AttributeGroupMap.end()) {
+    miss("attributes: a group that was not enumerated");
+    return 0;
+  }
+  return I->second;
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)

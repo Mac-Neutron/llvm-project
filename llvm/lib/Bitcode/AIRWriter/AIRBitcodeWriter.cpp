@@ -2943,8 +2943,16 @@ static void lowerIntrinsicCalls(Module &M, AIRWriteReport &R, WriteOnly &WO) {
         std::optional<TypeSize> Size = AI->getAllocationSize(M.getDataLayout());
         int64_t N = Size && !Size->isScalable() ? int64_t(Size->getFixedValue())
                                                 : -1;
-        WO.MarkerCalls.push_back(CallInst::Create(
-            F15, {ConstantInt::getSigned(I64, N), AI}, "", CI->getIterator()));
+        CallInst *New = CallInst::Create(
+            F15, {ConstantInt::getSigned(I64, N), AI}, "", CI->getIterator());
+        // The call's attributes, its pointer's now on argument 1 (lowered with
+        // every call's below).
+        AttributeList AL = CI->getAttributes();
+        New->setAttributes(AttributeList::get(C, AL.getFnAttrs(),
+                                              AL.getRetAttrs(),
+                                              {AttributeSet(),
+                                               AL.getParamAttrs(0)}));
+        WO.MarkerCalls.push_back(New);
         R.Explain.push_back(
             ("lifetime marker on " +
              (AI->hasName() ? "%" + AI->getName() : Twine("an alloca")) +

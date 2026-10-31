@@ -2,8 +2,9 @@
 ; are written in LLVM 15's form, llvm.lifetime.start/end.p0i8(i64 <size>,
 ; i8* <a cast of %a>), as the C++ AIR has them (controller ruling D3): the
 ; size is the alloca's allocation size, what the sizeless marker covers, and
-; -1 (LLVM 15's "unknown") for an alloca of no fixed size. A marker on poison
-; marks nothing and is dropped. LLVM 23's reader upgrades LLVM 15's form back
+; -1 (LLVM 15's "unknown") for an alloca of no fixed size; the call keeps its
+; attributes (InstCombine's nonnull, here). A marker on poison marks nothing
+; and is dropped. LLVM 23's reader upgrades LLVM 15's form back
 ; (AutoUpgrade: the declaration appended, the call on the cast-stripped
 ; alloca), and the module left behind says what it reads (P9's self row). A
 ; types file naming LLVM 15's declarations, as the C++ AIR's does, is
@@ -29,6 +30,9 @@
 ; STATS: cast %a to i8* for call @llvm.lifetime.end.p0i8 arg 1 (in @k)
 ; STATS: stats inst-casts=4 const-casts=0 use-typed=0
 
+; BC-LABEL: <PARAMATTR_GROUP_BLOCK_ID
+; BC: <ENTRY op0={{[0-9]+}} op1=2 op2=0 op3=39/>
+; BC-LABEL: </PARAMATTR_GROUP_BLOCK_ID>
 ; BC-DAG: record string = 'llvm.lifetime.start.p0i8'
 ; BC-DAG: record string = 'llvm.lifetime.end.p0i8'
 ; BC: <CONSTANTS_BLOCK
@@ -60,7 +64,7 @@ define i32 @k(i32 %i, i32 %n) {
 entry:
   %a = alloca [4 x i32], align 4
   %d = alloca i32, i32 %n, align 4
-  call void @llvm.lifetime.start.p0(ptr %a)
+  call void @llvm.lifetime.start.p0(ptr nonnull %a)
   call void @llvm.lifetime.start.p0(ptr %d)
   call void @llvm.lifetime.start.p0(ptr poison)
   %p = getelementptr inbounds [4 x i32], ptr %a, i32 0, i32 %i

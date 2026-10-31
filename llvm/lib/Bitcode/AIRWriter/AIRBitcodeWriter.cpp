@@ -2692,8 +2692,24 @@ static constexpr Attribute::AttrKind GuaranteeOnly[] = {
 /// 15 signature (L15/include/llvm/IR/Intrinsics.td) was checked equal to LLVM
 /// 23's when a controller ruling added it. LLVM 15 reads any other llvm.*
 /// declaration as a plain function, so only Metal would decide: an error.
-static constexpr StringLiteral LLVM15Intrinsics[] = {"llvm.umax.i64",
-                                                     "llvm.usub.sat.i32"};
+static constexpr StringLiteral LLVM15Intrinsics[] = {
+    "llvm.copysign.f16",
+    "llvm.copysign.f32",
+    "llvm.fabs.f32",
+    "llvm.fabs.v4f32",
+    "llvm.fshl.i32",
+    "llvm.is.fpclass.f32",
+    "llvm.is.fpclass.v4f32",
+    "llvm.smax.i32",
+    "llvm.smax.i64",
+    "llvm.smin.i32",
+    "llvm.smin.i64",
+    "llvm.umax.i32",
+    "llvm.umax.i64",
+    "llvm.umin.i32",
+    "llvm.umin.i64",
+    "llvm.usub.sat.i32",
+};
 
 /// AS with what LLVM 15 cannot hold dropped (guarantee-only kinds, captures
 /// other than none) or weakened (memory(...) to its strongest LLVM 15

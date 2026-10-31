@@ -32,6 +32,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ModuleSlotTracker.h"
 #include "llvm/IR/Operator.h"
@@ -539,6 +540,17 @@ Error AIRPointerTypes::Solver::init() {
     ValueNode[&A] = add(&A, Owner::Value, skel(A.getType()), false);
   for (Function &F : M) {
     auto *FT = cast_or_null<FunctionType>(T.entry(&F));
+    // The writer's own LLVM 15 lifetime markers (D3): void (i64, i8 AS*).
+    Intrinsic::ID ID = F.getIntrinsicID();
+    if (!FT && F.arg_size() == 2 &&
+        (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end)) {
+      unsigned AS = F.getArg(1)->getType()->getPointerAddressSpace();
+      FT = FunctionType::get(
+          Type::getVoidTy(Ctx),
+          {Type::getInt64Ty(Ctx),
+           TypedPointerType::get(Type::getInt8Ty(Ctx), AS)},
+          false);
+    }
     for (Argument &A : F.args()) {
       Type *Entry = T.entry(&A);
       if (FT && Entry && Entry != FT->getParamType(A.getArgNo()))

@@ -35,6 +35,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
@@ -55,6 +56,7 @@
 #include "llvm/IR/GlobalObject.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
@@ -2690,8 +2692,10 @@ static constexpr Attribute::AttrKind GuaranteeOnly[] = {
 
 /// The llvm.* intrinsics the writer writes (P13), mangled: each name's LLVM
 /// 15 signature (L15/include/llvm/IR/Intrinsics.td) was checked equal to LLVM
-/// 23's when a controller ruling added it. LLVM 15 reads any other llvm.*
-/// declaration as a plain function, so only Metal would decide: an error.
+/// 23's when a controller ruling added it, except the lifetime markers, which
+/// lowerIntrinsicCalls declares in LLVM 15's form (D3). LLVM 15 reads any
+/// other llvm.* declaration as a plain function, so only Metal would decide:
+/// an error.
 static constexpr StringLiteral LLVM15Intrinsics[] = {
     "llvm.copysign.f16",
     "llvm.copysign.f32",
@@ -2700,6 +2704,8 @@ static constexpr StringLiteral LLVM15Intrinsics[] = {
     "llvm.fshl.i32",
     "llvm.is.fpclass.f32",
     "llvm.is.fpclass.v4f32",
+    "llvm.lifetime.end.p0i8",
+    "llvm.lifetime.start.p0i8",
     "llvm.smax.i32",
     "llvm.smax.i64",
     "llvm.smin.i32",
@@ -2835,6 +2841,145 @@ static bool readerDefinesAttributes(Function &F) {
                                      Overloads);
 }
 
+namespace {
+/// What lowerToLLVM15 changes only for the write; restore() then leaves the
+/// module as LLVM 23 reads the written bytes (P9's self row).
+struct WriteOnly {
+  /// Intrinsic declarations, with LLVM 23's table attributes for them.
+  SmallVector<std::pair<Function *, AttributeList>, 4> ReaderDefined;
+  /// LLVM 15's lifetime markers (D3) and the calls to them.
+  SmallVector<Function *, 2> Markers;
+  SmallVector<CallInst *, 4> MarkerCalls;
+  /// Values taken out of the module, freed only in restore(): the type table
+  /// is keyed by pointer, so no freed address may come back during the write.
+  SmallVector<Instruction *, 4> DeadInsts;
+  SmallVector<Function *, 2> DeadFunctions;
+
+  void restore(Module &M) {
+    for (auto [F, AL] : ReaderDefined)
+      F->setAttributes(AL);
+    // LLVM 23's reader upgrades LLVM 15's markers (L23/lib/IR/AutoUpgrade.cpp
+    // :1586-1597, :5856-5875): each declaration appended anew, in module
+    // order, then each call put on its cast-stripped alloca.
+    SmallVector<Function *, 2> InOrder;
+    for (Function &F : M)
+      if (is_contained(Markers, &F))
+        InOrder.push_back(&F);
+    for (Function *F : InOrder)
+      Intrinsic::getOrInsertDeclaration(&M, F->getIntrinsicID(),
+                                        {F->getArg(1)->getType()});
+    for (CallInst *CI : MarkerCalls) {
+      Value *P = CI->getArgOperand(1)->stripPointerCasts();
+      if (isa<AllocaInst>(P)) {
+        IRBuilder<> B(CI);
+        if (CI->getCalledFunction()->getIntrinsicID() ==
+            Intrinsic::lifetime_start)
+          B.CreateLifetimeStart(P);
+        else
+          B.CreateLifetimeEnd(P);
+      }
+      CI->eraseFromParent();
+    }
+    for (Function *F : Markers)
+      F->eraseFromParent();
+    for (Instruction *I : DeadInsts)
+      I->deleteValue();
+    for (Function *F : DeadFunctions) {
+      M.getFunctionList().push_back(F);
+      F->eraseFromParent();
+    }
+  }
+};
+} // namespace
+
+/// Takes I out of the module until WO.restore().
+static void takeOut(Instruction *I, WriteOnly &WO) {
+  I->removeFromParent();
+  I->dropAllReferences();
+  WO.DeadInsts.push_back(I);
+}
+
+/// The intrinsic calls LLVM 15 holds in another form, rewritten: LLVM 23's
+/// sizeless lifetime markers as LLVM 15's (D3), llvm.scmp and llvm.ucmp,
+/// which LLVM 15 lacks, as icmp and select (D4). A declaration with a use
+/// left (not a call) stays, and the P13 check names it.
+static void lowerIntrinsicCalls(Module &M, AIRWriteReport &R, WriteOnly &WO) {
+  LLVMContext &C = M.getContext();
+  Type *I64 = Type::getInt64Ty(C);
+  DenseMap<Function *, Function *> Marker15;
+  SmallSetVector<Function *, 4> Lowered;
+  for (Function &G : M)
+    for (Instruction &I : make_early_inc_range(instructions(G))) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      Function *F = CI ? CI->getCalledFunction() : nullptr;
+      if (!F)
+        continue;
+      std::string In = (" (in @" + G.getName() + ")").str();
+      Intrinsic::ID ID = F->getIntrinsicID();
+      if ((ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end) &&
+          F->arg_size() == 1) {
+        // LLVM 15: llvm.lifetime.start/end.p<N>i8(i64 immarg size, i8* p),
+        // the size the alloca's (what the sizeless marker covers), -1 for an
+        // alloca of no fixed size. A marker on poison marks nothing.
+        Lowered.insert(F);
+        auto *AI = dyn_cast<AllocaInst>(CI->getArgOperand(0));
+        if (!AI) {
+          R.Explain.push_back("drop lifetime marker on poison" + In);
+          takeOut(CI, WO);
+          continue;
+        }
+        Function *&F15 = Marker15[F];
+        if (!F15) {
+          Type *P = F->getArg(0)->getType();
+          F15 = Function::Create(
+              FunctionType::get(Type::getVoidTy(C), {I64, P}, false),
+              GlobalValue::ExternalLinkage,
+              Twine("llvm.lifetime.") +
+                  (ID == Intrinsic::lifetime_start ? "start" : "end") + ".p" +
+                  Twine(P->getPointerAddressSpace()) + "i8");
+          M.getFunctionList().insert(F->getIterator(), F15);
+          WO.Markers.push_back(F15);
+        }
+        std::optional<TypeSize> Size = AI->getAllocationSize(M.getDataLayout());
+        int64_t N = Size && !Size->isScalable() ? int64_t(Size->getFixedValue())
+                                                : -1;
+        WO.MarkerCalls.push_back(CallInst::Create(
+            F15, {ConstantInt::getSigned(I64, N), AI}, "", CI->getIterator()));
+        R.Explain.push_back(
+            ("lifetime marker on " +
+             (AI->hasName() ? "%" + AI->getName() : Twine("an alloca")) +
+             ": @" + F15->getName() + " size " + Twine(N) + In)
+                .str());
+        takeOut(CI, WO);
+      } else if (ID == Intrinsic::scmp || ID == Intrinsic::ucmp) {
+        // a < b: -1, a > b: 1, else 0, in the call's return type.
+        Lowered.insert(F);
+        bool S = ID == Intrinsic::scmp;
+        StringRef P = S ? "scmp" : "ucmp";
+        Value *A = CI->getArgOperand(0), *B = CI->getArgOperand(1);
+        Type *RT = CI->getType();
+        IRBuilder<> IRB(CI);
+        Value *Lt = IRB.CreateICmp(S ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_ULT,
+                                   A, B, P + ".lt");
+        Value *Gt = IRB.CreateICmp(S ? ICmpInst::ICMP_SGT : ICmpInst::ICMP_UGT,
+                                   A, B, P + ".gt");
+        Value *Sel = IRB.CreateSelect(Gt, ConstantInt::get(RT, 1),
+                                      Constant::getNullValue(RT), P + ".sel");
+        Value *Res = IRB.CreateSelect(Lt, Constant::getAllOnesValue(RT), Sel);
+        Res->takeName(CI);
+        CI->replaceAllUsesWith(Res);
+        R.Explain.push_back("lower @" + F->getName().str() +
+                            " to icmp and select" + In);
+        takeOut(CI, WO);
+      }
+    }
+  for (Function *F : Lowered)
+    if (F->use_empty()) {
+      F->removeFromParent();
+      WO.DeadFunctions.push_back(F);
+    }
+}
+
 /// Makes M say only what LLVM 15's records can (P8): attributes and flags
 /// LLVM 23 added are dropped or weakened in the module itself and counted,
 /// so the module left behind is the module written; constructs LLVM 15
@@ -2843,11 +2988,9 @@ static bool readerDefinesAttributes(Function &F) {
 /// attributes (ReaderDefined): every reader resets them from its own table,
 /// so those are what the written module reads as, even where a pass added
 /// more (inferattrs adds mustprogress).
-static Error
-lowerToLLVM15(Module &M, AIRWriteReport &R,
-              SmallVectorImpl<std::pair<Function *, AttributeList>>
-                  &ReaderDefined) {
+static Error lowerToLLVM15(Module &M, AIRWriteReport &R, WriteOnly &WO) {
   LLVMContext &C = M.getContext();
+  lowerIntrinsicCalls(M, R, WO);
   for (Function &F : M) {
     if (!F.getName().starts_with("llvm.") ||
         is_contained(LLVM15Intrinsics, F.getName()))
@@ -2912,7 +3055,7 @@ lowerToLLVM15(Module &M, AIRWriteReport &R,
     if (!FL)
       return FL.takeError();
     if (readerDefinesAttributes(F))
-      ReaderDefined.push_back(
+      WO.ReaderDefined.push_back(
           {&F, Intrinsic::getAttributes(C, F.getIntrinsicID(),
                                         F.getFunctionType())});
     F.setAttributes(*FL);
@@ -3075,12 +3218,9 @@ Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
     R = &Local;
   if (Error E = checkNoDebugInfo(M))
     return E;
-  SmallVector<std::pair<Function *, AttributeList>, 4> ReaderDefined;
-  scope_exit Restore([&] {
-    for (auto [F, AL] : ReaderDefined)
-      F->setAttributes(AL);
-  });
-  if (Error E = lowerToLLVM15(M, *R, ReaderDefined))
+  WriteOnly WO;
+  scope_exit Restore([&] { WO.restore(M); });
+  if (Error E = lowerToLLVM15(M, *R, WO))
     return E;
   Expected<AIRPointerTypes> Types = AIRPointerTypes::run(M, T, *R);
   if (!Types)

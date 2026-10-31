@@ -339,6 +339,10 @@ bool readTypes(Module &M, StringRef Path, Table &T, std::string &Log) {
       return Bad("unknown line kind");
     if (!TypeParser::parseName(L, '@', Name))
       return Bad("bad name");
+    // The writer declares LLVM 15's lifetime markers itself (D3); the C++
+    // AIR's names (.p0i8) are gone once LLVM 23's reader upgraded them.
+    if (Kind == 'f' && StringRef(Name).starts_with("llvm.lifetime."))
+      continue;
     GlobalValue *GV = Kind == 'g' ? (GlobalValue *)M.getNamedGlobal(Name)
                                   : (GlobalValue *)M.getFunction(Name);
     if (!GV) {

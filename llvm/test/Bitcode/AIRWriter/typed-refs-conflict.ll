@@ -2,7 +2,7 @@
 ; RUN: echo 'f @air.atomic.local.add.s.i32 i32 (float addrspace(3)*, i32, i32, i32, i1)' > %t.types
 ; RUN: not llvm-air-write %s --types %t.types --ref %S/Inputs/helper-ref.air -o %t.bc 2>&1 | FileCheck %s
 
-; CHECK: error: typed ref: @air.atomic.local.add.s.i32 is i32 (typedptr(i32, 3), i32, i32, i32, i1), its entry i32 (typedptr(float, 3), i32, i32, i32, i1)
+; CHECK: error: typed ref: @air.atomic.local.add.s.i32 is i32 (i32 addrspace(3)*, i32, i32, i32, i1), its entry i32 (float addrspace(3)*, i32, i32, i32, i1)
 ; CHECK-NOT: stats
 
 target triple = "air64-apple-macosx14.0.0"

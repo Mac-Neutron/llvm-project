@@ -29,6 +29,15 @@
 ; RUN: tail -n +2 %t/intrinsic.dis.ll > %t/intrinsic.dis.tail
 ; RUN: tail -n +2 %t/intrinsic.post.ll > %t/intrinsic.post.tail
 ; RUN: diff %t/intrinsic.dis.tail %t/intrinsic.post.tail
+; LLVM 23's inferattrs adds mustprogress to the declaration (willreturn
+; implies it), beyond its intrinsic table: the module left behind still says
+; what LLVM 23 reads back, the table's attributes.
+; RUN: llvm-air-write %t/intrinsic.ll --passes inferattrs --emit-ll %t/inferred -o %t/inferred.bc 2>&1 | FileCheck %s --check-prefix=ISTATS
+; RUN: FileCheck %s --check-prefix=IPRE < %t/inferred.pre.ll
+; RUN: llvm-dis %t/inferred.bc -o %t/inferred.dis.ll
+; RUN: tail -n +2 %t/inferred.dis.ll > %t/inferred.dis.tail
+; RUN: tail -n +2 %t/inferred.post.ll > %t/inferred.post.tail
+; RUN: diff %t/inferred.dis.tail %t/inferred.post.tail
 
 ; STATS: stats inst-casts=0 const-casts=0 use-typed=0 attrs-dropped=7 flags-dropped=0
 
@@ -49,6 +58,7 @@
 ; IBC-NEXT: <ENTRY op0=1 op1=4294967295 op2=0 op3=71 op4=0 op5=62 op6=0 op7=63 op8=0 op9=18 op10=0 op11=53 op12=0 op13=61 op14=0 op15=20/>
 ; IBC-NEXT: </PARAMATTR_GROUP_BLOCK_ID>
 ; IPOST: attributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+; IPRE: attributes #{{[0-9]+}} = { mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
 
 ;--- drop.ll
 target triple = "air64-apple-macosx14.0.0"

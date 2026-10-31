@@ -2823,9 +2823,10 @@ static bool readerDefinesAttributes(Function &F) {
 /// LLVM 23 added are dropped or weakened in the module itself and counted,
 /// so the module left behind is the module written; constructs LLVM 15
 /// cannot hold at all are errors. An intrinsic declaration is written with
-/// its lowered attributes too, but its own come back after the write
-/// (ReaderDefined): every reader resets them from its table, so those are
-/// what the written module reads as.
+/// its lowered attributes too, and after the write it gets LLVM 23's table
+/// attributes (ReaderDefined): every reader resets them from its own table,
+/// so those are what the written module reads as, even where a pass added
+/// more (inferattrs adds mustprogress).
 static Error
 lowerToLLVM15(Module &M, AIRWriteReport &R,
               SmallVectorImpl<std::pair<Function *, AttributeList>>
@@ -2894,8 +2895,10 @@ lowerToLLVM15(Module &M, AIRWriteReport &R,
     Expected<AttributeList> FL = LowerList(F.getAttributes(), F.getName());
     if (!FL)
       return FL.takeError();
-    if (*FL != F.getAttributes() && readerDefinesAttributes(F))
-      ReaderDefined.push_back({&F, F.getAttributes()});
+    if (readerDefinesAttributes(F))
+      ReaderDefined.push_back(
+          {&F, Intrinsic::getAttributes(C, F.getIntrinsicID(),
+                                        F.getFunctionType())});
     F.setAttributes(*FL);
 
     for (Instruction &I : instructions(F)) {

@@ -13,7 +13,8 @@
 //
 // The types file has one entry per line, types in LLVM 15's typed syntax
 // (`i32 addrspace(1)*`), names as Module::print writes them (`@x`, `@"..."`,
-// `%x`):
+// `%x`; an unnamed struct `%0`, `%1`, ... numbered in the module as read,
+// before --passes):
 //   s <%struct> <typed literal body>
 //   g <@global> <typed value type>
 //   f <@function> <typed function type>
@@ -33,6 +34,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/TypeFinder.h"
 #include "llvm/IR/TypedPointerType.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -99,10 +101,34 @@ static cl::opt<bool> SelfTestLateType(
 
 namespace {
 
+/// The module's unnamed identified structs in Module::print's numbering (%0,
+/// %1, ...: TypeFinder order, as AsmWriter's TypePrinting numbers them).
+std::vector<StructType *> numberedStructs(const Module &M) {
+  TypeFinder Found;
+  Found.run(M, false);
+  std::vector<StructType *> R;
+  for (StructType *ST : Found)
+    if (!ST->isLiteral() && !ST->hasName())
+      R.push_back(ST);
+  return R;
+}
+
+/// A struct by its types-file name: named, or `%N` for the N-th unnamed one.
+StructType *structNamed(LLVMContext &Ctx, StringRef Name,
+                        ArrayRef<StructType *> Numbered) {
+  if (StructType *ST = StructType::getTypeByName(Ctx, Name))
+    return ST;
+  uint64_t N;
+  if (all_of(Name, isDigit) && !Name.getAsInteger(10, N) && N < Numbered.size())
+    return Numbered[N];
+  return nullptr;
+}
+
 /// LLVM 15's typed type syntax, over the module's context.
 class TypeParser {
   LLVMContext &Ctx;
   StringRef S;
+  ArrayRef<StructType *> Numbered;
   std::string Err;
 
   void ws() { S = S.ltrim(" \t"); }
@@ -168,7 +194,7 @@ class TypeParser {
       std::string Name;
       if (!parseName(S, '%', Name))
         return fail("bad struct name");
-      if (StructType *ST = StructType::getTypeByName(Ctx, Name))
+      if (StructType *ST = structNamed(Ctx, Name, Numbered))
         return ST;
       return fail("unknown struct %" + Name);
     }
@@ -200,7 +226,8 @@ class TypeParser {
   }
 
 public:
-  TypeParser(LLVMContext &Ctx, StringRef S) : Ctx(Ctx), S(S) {}
+  TypeParser(LLVMContext &Ctx, StringRef S, ArrayRef<StructType *> Numbered)
+      : Ctx(Ctx), S(S), Numbered(Numbered) {}
 
   /// `"`-quoted names take LLVM's `\XX` escapes.
   static bool parseName(StringRef &S, char Sigil, std::string &Out) {
@@ -289,8 +316,9 @@ struct Table {
 };
 
 /// Reads the types file into T. Prints positional mismatches and (after
-/// --passes) stale entries to Log.
-bool readTypes(Module &M, StringRef Path, Table &T, std::string &Log) {
+/// --passes) stale entries to Log. Numbered: numberedStructs before --passes.
+bool readTypes(Module &M, StringRef Path, ArrayRef<StructType *> Numbered,
+               Table &T, std::string &Log) {
   auto Buf = MemoryBuffer::getFile(Path);
   if (!Buf) {
     Log += ("error: " + Path + ": " + Buf.getError().message() + "\n").str();
@@ -326,10 +354,10 @@ bool readTypes(Module &M, StringRef Path, Table &T, std::string &Log) {
     if (Kind == 's') {
       if (!TypeParser::parseName(L, '%', Name))
         return Bad("bad struct name");
-      StructType *ST = StructType::getTypeByName(Ctx, Name);
+      StructType *ST = structNamed(Ctx, Name, Numbered);
       if (!ST)
         return Bad("unknown struct %" + Name);
-      Type *B = TypeParser(Ctx, L).all(TErr);
+      Type *B = TypeParser(Ctx, L, Numbered).all(TErr);
       if (!B)
         return Bad(TErr);
       T.Structs.push_back({wrap(ST), wrap(B)});
@@ -366,7 +394,7 @@ bool readTypes(Module &M, StringRef Path, Table &T, std::string &Log) {
         continue;
       }
     }
-    Type *Ty = TypeParser(Ctx, L).all(TErr);
+    Type *Ty = TypeParser(Ctx, L, Numbered).all(TErr);
     if (!Ty)
       return Bad(TErr);
     if (Kind == 'i') {
@@ -436,6 +464,9 @@ bool runJob(StringRef In, StringRef Types, StringRef Out, std::string &Log) {
     return false;
   }
 
+  // The unnamed structs are numbered as the types file saw them, before the
+  // passes delete any of their users.
+  std::vector<StructType *> Numbered = numberedStructs(*M);
   if (!Passes.empty()) {
     LoopAnalysisManager LAM;
     FunctionAnalysisManager FAM;
@@ -456,7 +487,7 @@ bool runJob(StringRef In, StringRef Types, StringRef Out, std::string &Log) {
   }
 
   Table T;
-  if (!Types.empty() && !readTypes(*M, Types, T, Log))
+  if (!Types.empty() && !readTypes(*M, Types, Numbered, T, Log))
     return false;
 
   std::vector<std::unique_ptr<MemoryBuffer>> RefBufs;

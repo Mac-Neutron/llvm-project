@@ -3219,6 +3219,108 @@ static void emitDarwinBCHeaderAndTrailer(SmallVectorImpl<char> &Buffer,
     Buffer.push_back(0);
 }
 
+/// Ruling D5: Metal's compiler crashes on LLVM 23 InstCombine's i1-vector bit
+/// tests, extractelement (bitcast <N x iW> %v to <N*W x i1>), K, and the load
+/// of <K x i1> InstCombine makes when a load's one user is that bitcast. LLVM
+/// 15 never makes them (it keeps icmp ne (and X, 1), 0 for a scalar and has no
+/// trunc-of-extractelement fold), so each constant-index extractelement is
+/// written in LLVM 15's form: the word's extractelement, and with the bit, icmp
+/// ne 0; the load loads <K/32 x i32>. Any other bitcast to an i1 vector or load
+/// of one, or any other use of it, is an error. What it replaces is taken out
+/// (takeOut), not freed, until the write is done.
+static Error legalizeBitTests(Module &M, AIRWriteReport &R, WriteOnly &WO) {
+  for (Function &F : M) {
+    // Each bitcast or load of an i1 vector, checked before anything changes,
+    // to the integer vector its bits are read from.
+    SmallVector<Instruction *, 4> Sources;
+    for (Instruction &I : instructions(F)) {
+      auto *VT = dyn_cast<FixedVectorType>(I.getType());
+      if (!VT || !VT->getElementType()->isIntegerTy(1) ||
+          !(isa<BitCastInst>(I) || isa<LoadInst>(I)))
+        continue;
+      unsigned K = VT->getNumElements();
+      auto Fail = [&](const Twine &Why) {
+        std::string What = I.getOpcodeName();
+        if (I.hasName())
+          What += " %" + I.getName().str();
+        return error(What + ": " + Why +
+                     " (Metal's compiler crashes on i1-vector bitcasts and "
+                     "loads) (in @" +
+                     F.getName() + ")");
+      };
+      auto *LI = dyn_cast<LoadInst>(&I);
+      auto *Src = LI ? nullptr
+                     : dyn_cast<FixedVectorType>(I.getOperand(0)->getType());
+      if (!LI && (!Src || !Src->getElementType()->isIntegerTy()))
+        return Fail("an i1 vector from other than an integer vector is not "
+                    "written");
+      if (LI && (K % 32 || !LI->isSimple()))
+        return Fail("<" + Twine(K) +
+                    " x i1> is not a whole number of 32-bit words");
+      for (User *U : I.users()) {
+        auto *EE = dyn_cast<ExtractElementInst>(U);
+        auto *Idx = EE ? dyn_cast<ConstantInt>(EE->getIndexOperand()) : nullptr;
+        if (!Idx || Idx->getValue().uge(K))
+          return Fail("<" + Twine(K) +
+                      " x i1> is written only as constant-index bit tests");
+      }
+      if (M.getDataLayout().isBigEndian())
+        return Fail("a big-endian layout is not written");
+      Sources.push_back(&I);
+    }
+    if (Sources.empty())
+      continue;
+
+    DenseMap<Value *, Value *> Words;
+    for (Instruction *I : Sources) {
+      auto *LI = dyn_cast<LoadInst>(I);
+      if (!LI) {
+        Words[I] = I->getOperand(0);
+        continue;
+      }
+      unsigned K = cast<FixedVectorType>(LI->getType())->getNumElements();
+      auto *NewLI = new LoadInst(
+          FixedVectorType::get(Type::getInt32Ty(M.getContext()), K / 32),
+          LI->getPointerOperand(), "", LI->isVolatile(), LI->getAlign(),
+          LI->getIterator());
+      NewLI->copyMetadata(*LI);
+      NewLI->takeName(LI);
+      Words[LI] = NewLI;
+    }
+    // In instruction order, so the --explain lines are too.
+    for (Instruction &I : make_early_inc_range(instructions(F))) {
+      auto *EE = dyn_cast<ExtractElementInst>(&I);
+      auto It = EE ? Words.find(EE->getVectorOperand()) : Words.end();
+      if (It == Words.end())
+        continue;
+      Value *V = It->second;
+      Type *WordTy = V->getType()->getScalarType();
+      unsigned W = WordTy->getIntegerBitWidth();
+      auto *Idx = cast<ConstantInt>(EE->getIndexOperand());
+      uint64_t Bit = Idx->getZExtValue();
+      auto *Word = ExtractElementInst::Create(
+          V, ConstantInt::get(Idx->getType(), Bit / W), "", EE->getIterator());
+      auto *And = BinaryOperator::CreateAnd(
+          Word, ConstantInt::get(WordTy, APInt::getOneBitSet(W, Bit % W)), "",
+          EE->getIterator());
+      auto *Cmp = new ICmpInst(EE->getIterator(), ICmpInst::ICMP_NE, And,
+                               Constant::getNullValue(WordTy));
+      Cmp->takeName(EE);
+      EE->replaceAllUsesWith(Cmp);
+      R.Explain.push_back(
+          "bit test " +
+          (Cmp->hasName() ? "%" + Cmp->getName().str()
+                          : std::string("(unnamed)")) +
+          ": extractelement " + typeName(EE->getVectorOperandType()) +
+          " -> extractelement, and, icmp ne (in @" + F.getName().str() + ")");
+      takeOut(EE, WO);
+    }
+    for (Instruction *I : Sources)
+      takeOut(I, WO);
+  }
+  return Error::success();
+}
+
 Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
                                  raw_ostream &OS, AIRWriteReport *R) {
   AIRWriteReport Local;
@@ -3229,6 +3331,8 @@ Error llvm::air::writeAIRBitcode(Module &M, const AIRTypeTable &T,
   WriteOnly WO;
   scope_exit Restore([&] { WO.restore(M); });
   if (Error E = lowerToLLVM15(M, *R, WO))
+    return E;
+  if (Error E = legalizeBitTests(M, *R, WO))
     return E;
   Expected<AIRPointerTypes> Types = AIRPointerTypes::run(M, T, *R);
   if (!Types)

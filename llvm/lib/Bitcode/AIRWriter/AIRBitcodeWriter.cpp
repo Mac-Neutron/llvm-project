@@ -18,7 +18,8 @@
 // kinds, memory and captures, fast-math flags, unnamed_addr, poison, freeze,
 // fneg, call markers, atomics' types and alignment, alloca, the
 // identification block, source file name, sync scope names, module hash and
-// Darwin wrapper. LLVM 23-only
+// Darwin wrapper; vector ConstantFP and ConstantInt splats as CST_CODE_DATA
+// (F-D5-1). LLVM 23-only
 // attributes and flags are dropped from the module first and counted; what
 // LLVM 15 cannot hold is an error, never an llvm_unreachable or assert.
 //
@@ -1585,7 +1586,17 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
     } else if (isa<UndefValue>(C)) {
       Code = bitc::CST_CODE_UNDEF;
     } else if (const ConstantInt *IV = dyn_cast<ConstantInt>(C)) {
-      if (IV->getBitWidth() <= 64) {
+      if (auto *VT = dyn_cast<FixedVectorType>(IV->getType())) {
+        if (IV->getBitWidth() <= 64) {
+          Code = bitc::CST_CODE_DATA;
+          Record.append(VT->getNumElements(), IV->getZExtValue());
+        } else {
+          fail("constant: a vector splat of " + typeName(IV->getType()) +
+               " has no LLVM 15 encoding");
+          Record.clear();
+          continue;
+        }
+      } else if (IV->getBitWidth() <= 64) {
         uint64_t V = IV->getSExtValue();
         emitSignedInt64(Record, V);
         Code = bitc::CST_CODE_INTEGER;
@@ -1622,7 +1633,18 @@ void AIRBitcodeWriter::writeConstants(unsigned FirstVal, unsigned LastVal,
       Code = bitc::CST_CODE_FLOAT;
       Type *Ty = CFP->getType()->getScalarType();
       if (Ty->isHalfTy() || Ty->isFloatTy() || Ty->isDoubleTy()) {
-        Record.push_back(CFP->getValueAPF().bitcastToAPInt().getZExtValue());
+        uint64_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
+        if (auto *VT = dyn_cast<FixedVectorType>(CFP->getType())) {
+          Code = bitc::CST_CODE_DATA;
+          Record.append(VT->getNumElements(), Bits);
+        } else {
+          Record.push_back(Bits);
+        }
+      } else if (CFP->getType()->isVectorTy()) {
+        fail("constant: a vector splat of " + typeName(CFP->getType()) +
+             " has no LLVM 15 encoding");
+        Record.clear();
+        continue;
       } else if (Ty->isX86_FP80Ty()) {
         // api needed to prevent premature destruction
         // bits are not in the same order as a normal i80 APInt, compensate.

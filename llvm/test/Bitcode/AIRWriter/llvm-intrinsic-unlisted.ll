@@ -37,6 +37,7 @@ declare i32 @llvm.smin.i32(i32, i32)
 declare i64 @llvm.smin.i64(i64, i64)
 declare i32 @llvm.fshl.i32(i32, i32, i32)
 declare float @llvm.fabs.f32(float)
+declare <2 x float> @llvm.fabs.v2f32(<2 x float>)
 declare <4 x float> @llvm.fabs.v4f32(<4 x float>)
 declare <4 x i1> @llvm.is.fpclass.v4f32(<4 x float>, i32 immarg)
 declare i1 @llvm.is.fpclass.f32(float, i32 immarg)
@@ -60,10 +61,13 @@ define i32 @k(i64 %a, i64 %b, i32 %c, i32 %d) {
   ret i32 %r
 }
 
-define <4 x i1> @fp(float %x, <4 x float> %v) {
+define <4 x i1> @fp(float %x, <2 x float> %u, <4 x float> %v) {
   %a = call float @llvm.fabs.f32(float %x)
+  %ua = call <2 x float> @llvm.fabs.v2f32(<2 x float> %u)
+  %u0 = extractelement <2 x float> %ua, i32 0
   %va = call <4 x float> @llvm.fabs.v4f32(<4 x float> %v)
-  %w = insertelement <4 x float> %va, float %a, i32 0
+  %w0 = insertelement <4 x float> %va, float %a, i32 0
+  %w = insertelement <4 x float> %w0, float %u0, i32 1
   %c = call <4 x i1> @llvm.is.fpclass.v4f32(<4 x float> %w, i32 516)
   %n = call i1 @llvm.is.fpclass.f32(float %a, i32 3)
   %c2 = insertelement <4 x i1> %c, i1 %n, i32 1

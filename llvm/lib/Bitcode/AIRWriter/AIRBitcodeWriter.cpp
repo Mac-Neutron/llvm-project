@@ -2722,6 +2722,7 @@ static constexpr StringLiteral LLVM15Intrinsics[] = {
     "llvm.copysign.f16",
     "llvm.copysign.f32",
     "llvm.fabs.f32",
+    "llvm.fabs.v2f32",
     "llvm.fabs.v4f32",
     "llvm.fshl.i32",
     "llvm.is.fpclass.f32",

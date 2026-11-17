@@ -16,6 +16,8 @@ add_subdirectory(CodeGen)
 add_subdirectory(CodeGenTypes)
 add_subdirectory(BinaryFormat)
 add_subdirectory(Bitcode)
+# Mac-Neutron: Modified by Mac-Neutron (2026): C entry points llvm-c lacks.
+add_subdirectory(AIRExtras)
 add_subdirectory(Bitstream)
 add_subdirectory(DWARFLinker)
 add_subdirectory(Extensions)
